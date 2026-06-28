@@ -685,10 +685,143 @@ async def serve_tts(key: str):
     return Response(content=audio, media_type="audio/mpeg")
 
 
-@app.get("/leads")
+@app.get("/leads", response_class=HTMLResponse)
 async def get_leads():
-    """Return all captured leads as JSON."""
-    return {"total": len(lead_data_store), "leads": lead_data_store}
+    """Return all captured leads as a formatted HTML table."""
+    leads = lead_data_store
+    total = len(leads)
+
+    if total == 0:
+        rows_html = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:40px;">No leads captured yet. Calls will appear here automatically.</td></tr>'
+    else:
+        rows_html = ""
+        for i, lead in enumerate(reversed(leads)):
+            ts = lead.get("timestamp", "")[:19].replace("T", " ")
+            name = lead.get("name") or lead.get("caller_number", "Unknown")
+            phone = lead.get("phone") or lead.get("caller_number", "—")
+            email = lead.get("email") or "—"
+            inquiry = lead.get("inquiry") or "—"
+            message = lead.get("message") or "—"
+            row_bg = "#1e293b" if i % 2 == 0 else "#162032"
+            rows_html += f"""
+            <tr style="background:{row_bg};">
+                <td>{ts}</td>
+                <td><strong>{name}</strong></td>
+                <td>{phone}</td>
+                <td>{email}</td>
+                <td>{inquiry}</td>
+                <td style="max-width:200px;word-wrap:break-word;">{message}</td>
+            </tr>"""
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Leads — Cascade RV Solar Solutions</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                background: #0f172a;
+                color: #e2e8f0;
+                min-height: 100vh;
+                padding: 30px 20px;
+            }}
+            .header {{
+                max-width: 1100px;
+                margin: 0 auto 24px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                flex-wrap: wrap;
+                gap: 12px;
+            }}
+            .header h1 {{ font-size: 22px; font-weight: 700; color: #f1f5f9; }}
+            .header .sub {{ font-size: 13px; color: #64748b; margin-top: 4px; }}
+            .back-btn {{
+                padding: 10px 20px;
+                background: #1e293b;
+                color: #38bdf8;
+                border: 2px solid #38bdf8;
+                border-radius: 10px;
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            .back-btn:hover {{ background: #38bdf820; }}
+            .badge {{
+                display: inline-block;
+                background: #38bdf820;
+                color: #38bdf8;
+                border-radius: 20px;
+                padding: 4px 14px;
+                font-size: 13px;
+                font-weight: 700;
+                margin-left: 12px;
+            }}
+            .table-wrap {{
+                max-width: 1100px;
+                margin: 0 auto;
+                overflow-x: auto;
+                border-radius: 14px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 14px;
+            }}
+            thead tr {{
+                background: #0f172a;
+            }}
+            thead th {{
+                padding: 14px 16px;
+                text-align: left;
+                color: #64748b;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                font-weight: 600;
+                white-space: nowrap;
+            }}
+            tbody td {{
+                padding: 14px 16px;
+                color: #cbd5e1;
+                vertical-align: top;
+                border-top: 1px solid #1e293b;
+            }}
+            tbody tr:hover td {{ background: #1e3a5f !important; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div>
+                <h1>Captured Leads <span class="badge">{total} total</span></h1>
+                <div class="sub">Cascade RV Solar Solutions &mdash; AI Receptionist</div>
+            </div>
+            <a href="/" class="back-btn">&larr; Back to Dashboard</a>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date &amp; Time</th>
+                        <th>Name</th>
+                        <th>Phone</th>
+                        <th>Email</th>
+                        <th>Inquiry</th>
+                        <th>Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>
+    """
 
 
 @app.post("/call-status")
