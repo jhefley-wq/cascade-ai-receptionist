@@ -207,9 +207,12 @@ def save_lead(call_sid: str, from_number: str, lead_data: dict):
     }
     lead_data_store.append(lead_entry)
 
-    leads_file = "/home/ubuntu/cascade_receptionist/leads.jsonl"
-    with open(leads_file, "a") as f:
-        f.write(json.dumps(lead_entry) + "\n")
+    leads_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.jsonl")
+    try:
+        with open(leads_file, "a") as f:
+            f.write(json.dumps(lead_entry) + "\n")
+    except Exception as e:
+        logger.warning(f"Could not write lead to file: {e}")
 
     logger.info(f"Lead captured: {lead_entry}")
 
@@ -541,9 +544,12 @@ async def recording_complete(
         "recording_url": RecordingUrl,
         "duration_seconds": RecordingDuration,
     }
-    leads_file = "/home/ubuntu/cascade_receptionist/leads.jsonl"
-    with open(leads_file, "a") as f:
-        f.write(json.dumps(voicemail_entry) + "\n")
+    leads_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.jsonl")
+    try:
+        with open(leads_file, "a") as f:
+            f.write(json.dumps(voicemail_entry) + "\n")
+    except Exception as e:
+        logger.warning(f"Could not write voicemail to file: {e}")
 
     response = VoiceResponse()
     response.say(
