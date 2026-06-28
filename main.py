@@ -159,6 +159,7 @@ IMPORTANT: Keep all spoken responses under 3 sentences when possible. Be profess
 # ─────────────────────────────────────────────
 conversations: dict[str, list[dict]] = {}
 lead_data_store: list[dict] = []
+tts_cache: dict[str, bytes] = {}  # cache TTS audio by text hash
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -279,8 +280,35 @@ def save_lead(call_sid: str, from_number: str, lead_data: dict):
     logger.info(f"Lead captured: {lead_entry}")
 
 
-def build_twiml_response(text: str, gather_action: str = "/respond", timeout: int = 5) -> str:
-    """Build a TwiML response with speech and gather."""
+def generate_tts_audio(text: str) -> bytes:
+    """Generate speech audio using OpenAI TTS (onyx voice) and return MP3 bytes."""
+    import hashlib
+    key = hashlib.md5(text.encode()).hexdigest()
+    if key in tts_cache:
+        return tts_cache[key]
+    response = openai_client.audio.speech.create(
+        model="tts-1",
+        voice="onyx",
+        input=text,
+        response_format="mp3",
+    )
+    audio_bytes = response.content
+    tts_cache[key] = audio_bytes
+    return audio_bytes
+
+
+def build_twiml_response(text: str, base_url: str, gather_action: str = "/respond", timeout: int = 5) -> str:
+    """Build a TwiML response using OpenAI TTS audio and gather."""
+    import hashlib
+    key = hashlib.md5(text.encode()).hexdigest()
+    # Pre-generate and cache the audio
+    try:
+        generate_tts_audio(text)
+        audio_url = f"{base_url}/tts/{key}"
+    except Exception as e:
+        logger.warning(f"TTS generation failed, falling back to Polly: {e}")
+        audio_url = None
+
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -289,31 +317,38 @@ def build_twiml_response(text: str, gather_action: str = "/respond", timeout: in
         speech_timeout="auto",
         language="en-US",
     )
-    gather.say(
-        text,
-        voice="Polly.Matthew",
-        language="en-US"
-    )
+    if audio_url:
+        gather.play(audio_url)
+    else:
+        gather.say(text, voice="Polly.Matthew", language="en-US")
     response.append(gather)
 
-    response.say(
-        "I didn't catch that. Please feel free to call back, or visit our website at cascade solar RV solutions dot com. Thank you for calling Cascade RV Solar Solutions. Have a great day!",
-        voice="Polly.Matthew",
-        language="en-US"
-    )
+    # Fallback if no speech detected
+    fallback = "I didn't catch that. Please feel free to call back, or visit our website at cascade solar RV solutions dot com. Thank you for calling Cascade RV Solar Solutions. Have a great day!"
+    try:
+        fb_key = hashlib.md5(fallback.encode()).hexdigest()
+        generate_tts_audio(fallback)
+        response.play(f"{base_url}/tts/{fb_key}")
+    except Exception:
+        response.say(fallback, voice="Polly.Matthew", language="en-US")
     return str(response)
 
 
-def build_voicemail_twiml() -> str:
+def build_voicemail_twiml(base_url: str) -> str:
     """TwiML for when receptionist is OFF — plays a simple voicemail message."""
-    response = VoiceResponse()
-    response.say(
+    vm_text = (
         "You have reached Cascade RV Solar Solutions. We are unable to take your call right now. "
         "Please leave a message after the tone, or visit our website at cascade solar RV solutions dot com. "
-        "We will get back to you as soon as possible. Thank you.",
-        voice="Polly.Matthew",
-        language="en-US"
+        "We will get back to you as soon as possible. Thank you."
     )
+    response = VoiceResponse()
+    try:
+        import hashlib
+        key = hashlib.md5(vm_text.encode()).hexdigest()
+        generate_tts_audio(vm_text)
+        response.play(f"{base_url}/tts/{key}")
+    except Exception:
+        response.say(vm_text, voice="Polly.Matthew", language="en-US")
     response.record(
         max_length=120,
         action="/recording-complete",
@@ -528,10 +563,12 @@ async def incoming_call(
     """Handle new incoming call."""
     logger.info(f"Incoming call: SID={CallSid}, From={From}, To={To}")
 
+    base_url = str(request.base_url).rstrip("/")
+
     # If receptionist is OFF, play voicemail
     if not receptionist_state["active"]:
         logger.info("Receptionist is OFF — routing to voicemail message")
-        twiml = build_voicemail_twiml()
+        twiml = build_voicemail_twiml(base_url)
         return Response(content=twiml, media_type="application/xml")
 
     # Initialize conversation
@@ -545,7 +582,7 @@ async def incoming_call(
         "I'm happy to help. How can I assist you today?"
     )
 
-    twiml = build_twiml_response(greeting)
+    twiml = build_twiml_response(greeting, base_url)
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -560,9 +597,12 @@ async def respond(
     """Handle caller speech input and return AI response."""
     logger.info(f"Speech from {From} [{CallSid}]: '{SpeechResult}' (confidence: {Confidence})")
 
+    base_url = str(request.base_url).rstrip("/")
+
     if not SpeechResult.strip():
         twiml = build_twiml_response(
-            "I'm sorry, I didn't catch that. Could you please repeat what you said?"
+            "I'm sorry, I didn't catch that. Could you please repeat what you said?",
+            base_url
         )
         return Response(content=twiml, media_type="application/xml")
 
@@ -576,16 +616,19 @@ async def respond(
     # Check for call-ending phrases
     end_phrases = ["goodbye", "bye", "thank you", "that's all", "that is all", "no more questions", "hang up"]
     if any(phrase in SpeechResult.lower() for phrase in end_phrases):
+        farewell = spoken_text + " Thank you for calling Cascade RV Solar Solutions. Have a wonderful day!"
+        import hashlib
         response = VoiceResponse()
-        response.say(
-            spoken_text + " Thank you for calling Cascade RV Solar Solutions. Have a wonderful day!",
-            voice="Polly.Matthew",
-            language="en-US"
-        )
+        try:
+            key = hashlib.md5(farewell.encode()).hexdigest()
+            generate_tts_audio(farewell)
+            response.play(f"{base_url}/tts/{key}")
+        except Exception:
+            response.say(farewell, voice="Polly.Matthew", language="en-US")
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
-    twiml = build_twiml_response(spoken_text)
+    twiml = build_twiml_response(spoken_text, base_url)
     return Response(content=twiml, media_type="application/xml")
 
 
@@ -613,14 +656,27 @@ async def recording_complete(
     except Exception as e:
         logger.warning(f"Could not write voicemail to file: {e}")
 
+    import hashlib
+    goodbye = "Thank you for your message. We will get back to you as soon as possible. Goodbye."
     response = VoiceResponse()
-    response.say(
-        "Thank you for your message. We will get back to you as soon as possible. Goodbye.",
-        voice="Polly.Matthew",
-        language="en-US"
-    )
+    try:
+        key = hashlib.md5(goodbye.encode()).hexdigest()
+        generate_tts_audio(goodbye)
+        base_url = str(request.base_url).rstrip("/")
+        response.play(f"{base_url}/tts/{key}")
+    except Exception:
+        response.say(goodbye, voice="Polly.Matthew", language="en-US")
     response.hangup()
-    return Response(content=str(response), media_type="application/xml")
+    return Response(content=str(response), media_type="application/xml"
+
+
+@app.get("/tts/{key}")
+async def serve_tts(key: str):
+    """Serve cached TTS audio by key."""
+    audio = tts_cache.get(key)
+    if not audio:
+        return Response(content="Not found", status_code=404)
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.get("/leads")
