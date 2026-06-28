@@ -1,373 +1,167 @@
 """
-Cascade RV Solar Solutions — AI Phone Receptionist
-===================================================
-Platform: Twilio (phone) + OpenAI GPT-4o (AI brain) + Twilio TTS (voice)
-Author: Built for Jason Hefley / Cascade RV Solar Solutions
-
-Call Flow:
-  - Jason sets his phone to Do Not Disturb
-  - Carrier forwards unanswered calls to the Twilio number
-  - This server answers, runs the AI receptionist, captures leads
-  - Jason can toggle the receptionist ON/OFF via the web dashboard
+Cascade RV Solar Solutions — AI Receptionist
+Uses OpenAI Realtime API + Twilio Media Streams for near-zero latency voice.
 """
 
 import os
 import json
+import base64
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse
-import openai
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from twilio.twiml.voice_response import VoiceResponse, Gather
-from dotenv import load_dotenv
+import websockets
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.responses import HTMLResponse, Response
+from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
-load_dotenv()
-
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("cascade-receptionist")
 
-app = FastAPI(title="Cascade RV Solar Solutions — AI Receptionist")
+# ── Environment variables ─────────────────────────────────────────────────────
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+TWILIO_ACCOUNT_SID  = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
+OWNER_PHONE         = os.environ.get("OWNER_PHONE", "+15039190521")
+OWNER_EMAIL         = os.environ.get("OWNER_EMAIL", "jhefley@cascadesolarrvsolutions.com")
+SENDGRID_API_KEY    = os.environ.get("SENDGRID_API_KEY", "")
+PORT                = int(os.environ.get("PORT", 8000))
 
-# ─────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OWNER_PHONE     = os.getenv("OWNER_PHONE", "+15039190521")
-OWNER_EMAIL     = os.getenv("OWNER_EMAIL", "jhefley@cascadesolarrvsolutions.com")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-BUSINESS_NAME   = "Cascade RV Solar Solutions"
+# ── OpenAI Realtime config ────────────────────────────────────────────────────
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+VOICE = "onyx"   # Deep, calm, professional American male
 
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+SYSTEM_MESSAGE = """You are Alex, the professional AI receptionist for Cascade RV Solar Solutions, 
+a mobile RV solar installation company based in Prineville, Oregon, owned by Jason Hefley.
 
-# ─────────────────────────────────────────────
-# Receptionist ON/OFF toggle state
-# ─────────────────────────────────────────────
-receptionist_state = {
-    "active": True,
-    "toggled_at": datetime.now().isoformat(),
-}
+PERSONALITY: Professional, warm, knowledgeable, and concise. You speak like a real person — 
+natural, friendly, and helpful. Keep responses SHORT — 1-3 sentences maximum unless the caller 
+asks for detailed information. Do not ramble.
 
-# ─────────────────────────────────────────────
-# System Prompt — AI Receptionist Persona
-# ─────────────────────────────────────────────
-SYSTEM_PROMPT = """
-You are Alex, the professional AI phone receptionist for Cascade RV Solar Solutions.
-You speak in a calm, confident, professional male voice with a neutral American accent.
-You are knowledgeable, helpful, and represent the brand with warmth and expertise.
-
-BUSINESS INFORMATION:
+COMPANY INFORMATION:
 - Business: Cascade RV Solar Solutions
 - Owner: Jason Hefley
-- Location: Prineville, Oregon (Central Oregon)
 - Phone: (503) 919-0521
-- Email: jhefley@cascadesolarrvsolutions.com
+- Location: Prineville, Oregon
+- Service Area: All of Oregon (mobile service — we come to you)
 - Website: cascadesolarrvsolutions.com
+- Experience: 30+ years in solar and electrical systems
 
 SERVICES:
-1. Free Consultation — Discuss RV setup, boondocking goals, power needs, and budget
-2. Custom Installation — Professional off-grid solar system installation (~5 days on-site)
-3. Troubleshooting & Repair — Electrical diagnosis and repair of existing RV electrical systems
-4. DIY Tools — Wire size calculator, system design tool, system analyzer
-5. Training Resources — Educational content for DIY solar independence
-6. Shop — Solar components and equipment
-7. Financing — Available through Enhancify (soft credit pull, no impact on credit score)
-
-SERVICE AREA:
-- All of Oregon (statewide mobile installation)
-- Including Portland, Bend, Eugene, Medford, and everywhere in between
-- Mileage rates apply but are kept minimal
-
-PRICING:
-- Costs vary based on power load requirements and personal goals
-- No one-size-fits-all answer; best starting point is the RV Solar Calculator on the website
+- Custom RV solar system design and installation
+- Solar consultation and system sizing
+- Troubleshooting and repair of existing solar systems
+- DIY guidance and training
 - Financing available through Enhancify
+- Preferred brands: Victron, Renogy, EPOCH batteries
 
-TIMELINE:
-- Installation: approximately 5 days on-site once parts are in hand
-- Parts lead time: approximately 2 weeks
-- Currently booked out 4–6 weeks in advance
-- Recommend reaching out early to secure a spot
-
-WARRANTY:
-- 1-year warranty on all installation labor
-- Product warranties handled directly through manufacturers
-
-BRANDS:
-- Victron Energy, Renogy, EPOCH Batteries (others available on request)
-
-EXPERIENCE:
-- 30+ years in critical infrastructure
-- Deep specialization in batteries, inverters, charge controllers, and complex power systems
+PRICING & TIMELINE:
+- Free consultations available
+- Typical installation: 4-5 days of work
+- Booking lead time: approximately 4-6 weeks out
+- 1-year labor warranty on all installations
 
 FREQUENTLY ASKED QUESTIONS:
-Q: What services do you offer?
-A: We offer free consultations, custom solar system design, professional installation, electrical troubleshooting and repair, DIY tools and training resources, and financing options.
+Q: What areas do you serve?
+A: We serve all of Oregon. We're mobile, so we come to your location.
 
-Q: Where do you serve?
-A: We serve all of Oregon with mobile installation available statewide, including Portland, Bend, Eugene, Medford, and everywhere in between. We're based in Prineville, Oregon.
-
-Q: How much does it cost?
-A: Costs vary depending on your RV's power needs and your goals. The best starting point is our free consultation or the RV Solar Calculator on our website. We also offer financing through Enhancify.
+Q: How much does a solar installation cost?
+A: It varies based on system size and complexity. Jason offers free consultations to provide accurate quotes. Would you like to schedule one?
 
 Q: How long does installation take?
-A: Once all parts are in hand, installation typically takes about 5 days on-site. Parts generally have a 2-week lead time, and we're currently booked out 4 to 6 weeks, so we recommend reaching out early.
-
-Q: Do you offer a warranty?
-A: Yes. We provide a 1-year warranty on all installation labor. Product warranties are handled directly through the manufacturers.
+A: Most installations take 4-5 days. We're typically booked about 4-6 weeks out.
 
 Q: What brands do you use?
-A: We primarily work with Victron Energy, Renogy, and EPOCH Batteries. We're also happy to work with other brands upon request.
+A: We work with premium brands including Victron, Renogy, and EPOCH batteries.
 
-Q: How do I get started?
-A: The best first step is to schedule a free consultation. You can call us at (503) 919-0521 or visit our website at cascadesolarrvsolutions.com.
+Q: Do you offer financing?
+A: Yes, we offer financing through Enhancify. Jason can walk you through the options during a consultation.
 
-Q: Is financing available?
-A: Yes, financing is available through our partner Enhancify. Checking your eligibility is a soft credit pull and will not affect your credit score.
+Q: Do you work on all types of RVs?
+A: Yes — motorhomes, fifth wheels, travel trailers, toy haulers, and more.
 
-Q: Can I install it myself?
-A: Absolutely. After your consultation, we can design a complete system and provide a step-by-step plan for a DIY installation, or we can handle the entire installation for you.
+LEAD CAPTURE:
+When a caller wants a callback, consultation, or to leave a message, collect:
+1. Their full name
+2. Best phone number to reach them
+3. Email address (optional but helpful)
+4. Brief description of what they need
 
-Q: Why solar instead of a generator?
-A: Generators are noisy, require fuel, need regular maintenance, and are restricted in many camping areas. Solar gives you clean, quiet, reliable power with no ongoing fuel costs — and it lets you boondock in places where generators simply aren't allowed.
+After collecting their info, confirm it back to them and let them know Jason will be in touch soon.
 
-CALL HANDLING RULES:
-- Always greet callers warmly and professionally as Alex from Cascade RV Solar Solutions.
-- Answer questions using the business information above.
-- If a caller wants to speak with Jason directly, let them know Jason is currently unavailable but you'll make sure he gets their message and calls them back promptly.
-- If a caller has an urgent technical issue with an existing installation, acknowledge the urgency and collect their information for a priority callback.
-- Always try to capture the caller's: full name, phone number, email address, and the nature of their inquiry.
-- When collecting information, ask one question at a time — do not overwhelm the caller.
-- If a caller wants to leave a message, collect it and confirm you'll pass it along to Jason.
-- Be concise. Phone conversations should be efficient — do not give overly long responses.
-- Always end calls by thanking the caller and letting them know Jason will follow up with them shortly.
-- Never make up information not listed above. If unsure, offer to have Jason call them back.
+IMPORTANT RULES:
+- Never make up prices or specific technical specs you are not sure about
+- If asked something you don't know, say Jason will be happy to discuss it during a consultation
+- Always be warm and professional
+- Keep answers brief and conversational
+- If the caller seems to be in an emergency (e.g., electrical issue, fire risk), advise them to call 911 or a licensed electrician immediately"""
 
-LEAD CAPTURE TRIGGER:
-When you have successfully collected the caller's name, phone number, and/or email, include a special JSON block at the END of your response (after your spoken words) in this exact format — the system will strip it before speaking:
-[LEAD_DATA:{"name":"...", "phone":"...", "email":"...", "inquiry":"...", "message":"..."}]
+LOG_EVENT_TYPES = [
+    "error",
+    "response.content.done",
+    "rate_limits.updated",
+    "response.done",
+    "input_audio_buffer.committed",
+    "input_audio_buffer.speech_stopped",
+    "input_audio_buffer.speech_started",
+    "session.created",
+]
 
-IMPORTANT: Keep all spoken responses under 3 sentences when possible. Be professional, warm, and efficient.
-"""
-
-# ─────────────────────────────────────────────
-# In-memory conversation store (per call SID)
-# ─────────────────────────────────────────────
-conversations: dict[str, list[dict]] = {}
-lead_data_store: list[dict] = []
-tts_cache: dict[str, bytes] = {}  # cache TTS audio by text hash
-
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-
-def get_ai_response(call_sid: str, user_input: str) -> tuple[str, Optional[dict]]:
-    """Get AI response and extract any lead data."""
-    if call_sid not in conversations:
-        conversations[call_sid] = []
-
-    conversations[call_sid].append({"role": "user", "content": user_input})
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversations[call_sid]
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        max_tokens=300,
-        temperature=0.7,
-    )
-
-    full_response = response.choices[0].message.content.strip()
-
-    # Extract lead data if present
-    lead_data = None
-    spoken_response = full_response
-
-    if "[LEAD_DATA:" in full_response:
-        try:
-            start = full_response.index("[LEAD_DATA:") + len("[LEAD_DATA:")
-            end   = full_response.index("]", start)
-            json_str = full_response[start:end]
-            lead_data = json.loads(json_str)
-            spoken_response = full_response[:full_response.index("[LEAD_DATA:")].strip()
-        except Exception as e:
-            logger.warning(f"Failed to parse lead data: {e}")
-
-    conversations[call_sid].append({"role": "assistant", "content": spoken_response})
-
-    return spoken_response, lead_data
+# ── App state ─────────────────────────────────────────────────────────────────
+app = FastAPI()
+receptionist_state = {"active": True, "toggled_at": "Never"}
+lead_data_store = []
 
 
-def send_lead_email(lead_entry: dict):
-    """Send an instant email notification to Jason when a lead is captured."""
+# ── Email notification ────────────────────────────────────────────────────────
+def send_lead_email(lead: dict):
+    """Send lead notification email via SendGrid."""
     if not SENDGRID_API_KEY:
-        logger.warning("No SENDGRID_API_KEY set — skipping email notification")
+        logger.warning("SendGrid API key not set — skipping email")
         return
     try:
-        name     = lead_entry.get("name", "Not provided")
-        phone    = lead_entry.get("phone", lead_entry.get("caller_number", "Not provided"))
-        email    = lead_entry.get("email", "Not provided")
-        inquiry  = lead_entry.get("inquiry", "Not provided")
-        message  = lead_entry.get("message", "Not provided")
-        timestamp = lead_entry.get("timestamp", datetime.now().isoformat())
-
-        subject = f"📞 New Lead from AI Receptionist — {name}"
-        body = f"""New lead captured by your AI Receptionist!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CALLER INFORMATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Name:     {name}
-Phone:    {phone}
-Email:    {email}
-Inquiry:  {inquiry}
-Message:  {message}
-Time:     {timestamp}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Log in to your dashboard to view all leads.
-
-— Cascade RV Solar Solutions AI Receptionist"""
-
-        import urllib.request
-        import urllib.parse
-        payload = json.dumps({
-            "personalizations": [{"to": [{"email": OWNER_EMAIL}]}],
-            "from": {"email": "jhefley@cascadesolarrvsolutions.com", "name": "Alex — AI Receptionist"},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": body}]
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            "https://api.sendgrid.com/v3/mail/send",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            method="POST"
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f9fa;padding:20px;border-radius:8px;">
+          <div style="background:#1a3a5c;color:white;padding:20px;border-radius:8px 8px 0 0;">
+            <h2 style="margin:0;">&#128222; New Lead — Cascade RV Solar Solutions</h2>
+            <p style="margin:4px 0 0;opacity:0.8;font-size:14px;">Captured by your AI Receptionist</p>
+          </div>
+          <div style="background:white;padding:24px;border-radius:0 0 8px 8px;">
+            <table style="width:100%;border-collapse:collapse;">
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;width:120px;"><strong>Name</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('name','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Phone</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('phone','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Email</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('email','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Inquiry</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('inquiry','—')}</td></tr>
+              <tr><td style="padding:10px;color:#666;"><strong>Message</strong></td><td style="padding:10px;">{lead.get('message','—')}</td></tr>
+            </table>
+            <p style="margin-top:20px;font-size:12px;color:#999;">Received: {lead.get('timestamp','')[:19].replace('T',' ')} UTC</p>
+            <p style="margin-top:4px;font-size:12px;color:#999;">Log in to your dashboard to view all leads.</p>
+          </div>
+          <p style="text-align:center;margin-top:16px;font-size:12px;color:#aaa;">— Cascade RV Solar Solutions AI Receptionist</p>
+        </div>
+        """
+        message = Mail(
+            from_email=OWNER_EMAIL,
+            to_emails=OWNER_EMAIL,
+            subject=f"New Lead: {lead.get('name', 'Unknown Caller')} — Cascade RV Solar",
+            html_content=html,
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info(f"Lead email sent to {OWNER_EMAIL} — status {resp.status}")
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        sg.send(message)
+        logger.info(f"Lead email sent for {lead.get('name')}")
     except Exception as e:
-        logger.warning(f"Failed to send lead email: {e}")
+        logger.error(f"Failed to send lead email: {e}")
 
 
-def save_lead(call_sid: str, from_number: str, lead_data: dict):
-    """Save captured lead data to file, memory, and send email notification."""
-    lead_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "call_sid": call_sid,
-        "caller_number": from_number,
-        **lead_data
-    }
-    lead_data_store.append(lead_entry)
-
-    leads_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.jsonl")
-    try:
-        with open(leads_file, "a") as f:
-            f.write(json.dumps(lead_entry) + "\n")
-    except Exception as e:
-        logger.warning(f"Could not write lead to file: {e}")
-
-    # Send instant email notification
-    send_lead_email(lead_entry)
-
-    logger.info(f"Lead captured: {lead_entry}")
-
-
-async def generate_tts_audio(text: str) -> bytes:
-    """Generate speech audio using OpenAI TTS (onyx voice) asynchronously."""
-    import hashlib
-    import asyncio
-    key = hashlib.md5(text.encode()).hexdigest()
-    if key in tts_cache:
-        return tts_cache[key]
-    # Run the blocking OpenAI call in a thread pool to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    def _call_openai():
-        resp = openai_client.audio.speech.create(
-            model="tts-1",
-            voice="onyx",
-            input=text,
-            response_format="mp3",
-        )
-        return resp.content
-    audio_bytes = await loop.run_in_executor(None, _call_openai)
-    tts_cache[key] = audio_bytes
-    return audio_bytes
-
-
-async def build_twiml_response(text: str, base_url: str, gather_action: str = "/respond", timeout: int = 5) -> str:
-    """Build a TwiML response using OpenAI TTS audio and gather."""
-    import hashlib
-    key = hashlib.md5(text.encode()).hexdigest()
-    try:
-        await generate_tts_audio(text)
-        audio_url = f"{base_url}/tts/{key}"
-    except Exception as e:
-        logger.warning(f"TTS generation failed, falling back to Polly: {e}")
-        audio_url = None
-
-    response = VoiceResponse()
-    gather = Gather(
-        input="speech",
-        action=gather_action,
-        timeout=timeout,
-        speech_timeout="auto",
-        language="en-US",
-    )
-    if audio_url:
-        gather.play(audio_url)
-    else:
-        gather.say(text, voice="Polly.Matthew-Neural", language="en-US")
-    response.append(gather)
-
-    # Fallback if no speech detected
-    fallback = "I didn't catch that. Please feel free to call back, or visit our website at cascade solar RV solutions dot com. Thank you for calling Cascade RV Solar Solutions. Have a great day!"
-    try:
-        fb_key = hashlib.md5(fallback.encode()).hexdigest()
-        await generate_tts_audio(fallback)
-        response.play(f"{base_url}/tts/{fb_key}")
-    except Exception:
-        response.say(fallback, voice="Polly.Matthew-Neural", language="en-US")
-    return str(response)
-
-
-async def build_voicemail_twiml(base_url: str) -> str:
-    """TwiML for when receptionist is OFF — plays a simple voicemail message."""
-    import hashlib
-    vm_text = (
-        "You have reached Cascade RV Solar Solutions. We are unable to take your call right now. "
-        "Please leave a message after the tone, or visit our website at cascade solar RV solutions dot com. "
-        "We will get back to you as soon as possible. Thank you."
-    )
-    response = VoiceResponse()
-    try:
-        key = hashlib.md5(vm_text.encode()).hexdigest()
-        await generate_tts_audio(vm_text)
-        response.play(f"{base_url}/tts/{key}")
-    except Exception:
-        response.say(vm_text, voice="Polly.Matthew-Neural", language="en-US")
-    response.record(
-        max_length=120,
-        action="/recording-complete",
-        finish_on_key="#",
-        play_beep=True,
-    )
-    return str(response)
-
-
-# ─────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def root():
+async def dashboard():
     """Status dashboard with ON/OFF toggle."""
     is_active = receptionist_state["active"]
     status_color = "#22c55e" if is_active else "#ef4444"
@@ -525,8 +319,8 @@ async def root():
                     <div class="stat-label">Leads Captured</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number">{len(conversations)}</div>
-                    <div class="stat-label">Active Calls</div>
+                    <div class="stat-number">Realtime</div>
+                    <div class="stat-label">Voice Engine</div>
                 </div>
             </div>
 
@@ -550,140 +344,233 @@ async def toggle_receptionist(action: str = "on"):
     receptionist_state["toggled_at"] = datetime.now().strftime("%Y-%m-%d %I:%M %p")
     status = "ACTIVE" if receptionist_state["active"] else "INACTIVE"
     logger.info(f"Receptionist toggled: {status}")
-    # Redirect back to dashboard
     return Response(
         content='<html><head><meta http-equiv="refresh" content="0;url=/"></head></html>',
-        media_type="text/html"
+        media_type="text/html",
     )
 
 
-@app.post("/incoming-call")
-async def incoming_call(
-    request: Request,
-    CallSid: str = Form(...),
-    From: str = Form(default="Unknown"),
-    To: str = Form(default=""),
-):
-    """Handle new incoming call."""
-    logger.info(f"Incoming call: SID={CallSid}, From={From}, To={To}")
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def incoming_call(request: Request):
+    """Handle incoming Twilio calls."""
+    host = request.headers.get("host", "")
+    response = VoiceResponse()
 
-    base_url = str(request.base_url).rstrip("/")
-
-    # If receptionist is OFF, play voicemail
     if not receptionist_state["active"]:
-        logger.info("Receptionist is OFF — routing to voicemail message")
-        twiml = await build_voicemail_twiml(base_url)
-        return Response(content=twiml, media_type="application/xml")
-
-    # Initialize conversation
-    conversations[CallSid] = []
-
-    greeting = (
-        "Thank you for calling Cascade RV Solar Solutions. "
-        "My name is Alex, and I'm here to assist you today. "
-        "Whether you have questions about our solar installation services, "
-        "want to schedule a free consultation, or need troubleshooting support, "
-        "I'm happy to help. How can I assist you today?"
-    )
-
-    twiml = await build_twiml_response(greeting, base_url)
-    return Response(content=twiml, media_type="application/xml")
-
-
-@app.post("/respond")
-async def respond(
-    request: Request,
-    CallSid: str = Form(...),
-    From: str = Form(default="Unknown"),
-    SpeechResult: str = Form(default=""),
-    Confidence: str = Form(default="0"),
-):
-    """Handle caller speech input and return AI response."""
-    logger.info(f"Speech from {From} [{CallSid}]: '{SpeechResult}' (confidence: {Confidence})")
-
-    base_url = str(request.base_url).rstrip("/")
-
-    if not SpeechResult.strip():
-        twiml = await build_twiml_response(
-            "I'm sorry, I didn't catch that. Could you please repeat what you said?",
-            base_url
+        response.say(
+            "Thank you for calling Cascade RV Solar Solutions. We are currently unavailable. "
+            "Please leave a message after the tone and we will return your call shortly.",
+            voice="Polly.Matthew-Neural",
         )
-        return Response(content=twiml, media_type="application/xml")
-
-    # Get AI response (run in executor to avoid blocking)
-    import asyncio
-    loop = asyncio.get_event_loop()
-    spoken_text, lead_data = await loop.run_in_executor(None, get_ai_response, CallSid, SpeechResult)
-
-    # Save lead if captured
-    if lead_data:
-        save_lead(CallSid, From, lead_data)
-
-    # Check for call-ending phrases
-    end_phrases = ["goodbye", "bye", "thank you", "that's all", "that is all", "no more questions", "hang up"]
-    if any(phrase in SpeechResult.lower() for phrase in end_phrases):
-        farewell = spoken_text + " Thank you for calling Cascade RV Solar Solutions. Have a wonderful day!"
-        import hashlib
-        response = VoiceResponse()
-        try:
-            key = hashlib.md5(farewell.encode()).hexdigest()
-            await generate_tts_audio(farewell)
-            response.play(f"{base_url}/tts/{key}")
-        except Exception:
-            response.say(farewell, voice="Polly.Matthew-Neural", language="en-US")
+        response.record(max_length=120, play_beep=True)
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
-    twiml = await build_twiml_response(spoken_text, base_url)
-    return Response(content=twiml, media_type="application/xml")
+    response.say(
+        "Thank you for calling Cascade RV Solar Solutions. Please hold for just a moment.",
+        voice="Polly.Matthew-Neural",
+    )
 
+    connect = Connect()
+    connect.stream(url=f"wss://{host}/media-stream")
+    response.append(connect)
 
-@app.post("/recording-complete")
-async def recording_complete(
-    CallSid: str = Form(...),
-    RecordingUrl: str = Form(default=""),
-    RecordingDuration: str = Form(default="0"),
-):
-    """Handle completed voicemail recordings (when receptionist is OFF)."""
-    logger.info(f"Voicemail recorded: {RecordingUrl} ({RecordingDuration}s) for call {CallSid}")
-
-    # Save voicemail record
-    voicemail_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "call_sid": CallSid,
-        "type": "voicemail",
-        "recording_url": RecordingUrl,
-        "duration_seconds": RecordingDuration,
-    }
-    leads_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.jsonl")
-    try:
-        with open(leads_file, "a") as f:
-            f.write(json.dumps(voicemail_entry) + "\n")
-    except Exception as e:
-        logger.warning(f"Could not write voicemail to file: {e}")
-
-    import hashlib
-    goodbye = "Thank you for your message. We will get back to you as soon as possible. Goodbye."
-    response = VoiceResponse()
-    try:
-        key = hashlib.md5(goodbye.encode()).hexdigest()
-        await generate_tts_audio(goodbye)
-        base_url = str(request.base_url).rstrip("/")
-        response.play(f"{base_url}/tts/{key}")
-    except Exception:
-        response.say(goodbye, voice="Polly.Matthew-Neural", language="en-US")
-    response.hangup()
     return Response(content=str(response), media_type="application/xml")
 
 
-@app.get("/tts/{key}")
-async def serve_tts(key: str):
-    """Serve cached TTS audio by key."""
-    audio = tts_cache.get(key)
-    if not audio:
-        return Response(content="Not found", status_code=404)
-    return Response(content=audio, media_type="audio/mpeg")
+@app.websocket("/media-stream")
+async def media_stream(websocket: WebSocket):
+    """WebSocket endpoint bridging Twilio Media Streams ↔ OpenAI Realtime API."""
+    await websocket.accept()
+    logger.info("Twilio Media Stream connected")
 
+    # Per-call lead tracking
+    call_lead = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "call_sid": None,
+        "caller_number": None,
+        "name": None,
+        "phone": None,
+        "email": None,
+        "inquiry": None,
+        "message": None,
+    }
+    stream_sid = None
+
+    async with websockets.connect(
+        OPENAI_REALTIME_URL,
+        extra_headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1",
+        },
+    ) as openai_ws:
+
+        await send_session_update(openai_ws)
+        # Send initial greeting
+        await send_initial_greeting(openai_ws)
+
+        async def receive_from_twilio():
+            """Receive audio from Twilio and forward to OpenAI."""
+            nonlocal stream_sid
+            try:
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    event = data.get("event")
+
+                    if event == "start":
+                        stream_sid = data["start"]["streamSid"]
+                        call_lead["call_sid"] = data["start"].get("callSid")
+                        call_lead["caller_number"] = (
+                            data["start"].get("customParameters", {}).get("caller")
+                            or data["start"].get("from")
+                        )
+                        logger.info(f"Stream started: {stream_sid}")
+
+                    elif event == "media":
+                        if openai_ws.open:
+                            audio_append = {
+                                "type": "input_audio_buffer.append",
+                                "audio": data["media"]["payload"],
+                            }
+                            await openai_ws.send(json.dumps(audio_append))
+
+                    elif event == "stop":
+                        logger.info("Stream stopped")
+                        break
+            except Exception as e:
+                logger.error(f"Error receiving from Twilio: {e}")
+
+        async def send_to_twilio():
+            """Receive responses from OpenAI and forward audio to Twilio."""
+            nonlocal stream_sid
+            try:
+                async for openai_message in openai_ws:
+                    response = json.loads(openai_message)
+                    event_type = response.get("type")
+
+                    if event_type in LOG_EVENT_TYPES:
+                        logger.info(f"OpenAI event: {event_type}")
+
+                    # Stream audio back to Twilio
+                    if event_type == "response.audio.delta" and response.get("delta"):
+                        audio_delta = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": response["delta"]},
+                        }
+                        await websocket.send_text(json.dumps(audio_delta))
+
+                    # Interrupt handling — clear buffer when user starts speaking
+                    if event_type == "input_audio_buffer.speech_started":
+                        logger.info("Speech detected — clearing buffer")
+                        await websocket.send_text(json.dumps({
+                            "event": "clear",
+                            "streamSid": stream_sid,
+                        }))
+
+                    # Extract lead info from conversation transcript
+                    if event_type == "response.done":
+                        output = response.get("response", {}).get("output", [])
+                        for item in output:
+                            if item.get("type") == "message":
+                                for content in item.get("content", []):
+                                    if content.get("type") == "text":
+                                        text = content.get("text", "").lower()
+                                        _extract_lead_from_text(text, call_lead)
+
+            except Exception as e:
+                logger.error(f"Error sending to Twilio: {e}")
+            finally:
+                # Save lead if we captured any info
+                _finalize_lead(call_lead)
+
+        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+
+    logger.info("WebSocket session closed")
+
+
+def _extract_lead_from_text(text: str, lead: dict):
+    """Simple heuristic extraction of lead info from AI transcript."""
+    import re
+    # Phone numbers
+    phones = re.findall(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", text)
+    if phones and not lead["phone"]:
+        lead["phone"] = phones[0]
+    # Emails
+    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    if emails and not lead["email"]:
+        lead["email"] = emails[0]
+
+
+def _finalize_lead(lead: dict):
+    """Save lead to store and send email if we got useful info."""
+    if lead.get("phone") or lead.get("email") or lead.get("name"):
+        lead_data_store.append(lead)
+        logger.info(f"Lead saved: {lead.get('name') or lead.get('caller_number')}")
+        try:
+            send_lead_email(lead)
+        except Exception as e:
+            logger.error(f"Email error: {e}")
+
+
+async def send_session_update(openai_ws):
+    """Send session configuration to OpenAI Realtime API."""
+    session_update = {
+        "type": "session.update",
+        "session": {
+            "turn_detection": {"type": "server_vad"},
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "voice": VOICE,
+            "instructions": SYSTEM_MESSAGE,
+            "modalities": ["text", "audio"],
+            "temperature": 0.7,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "capture_lead",
+                    "description": "Call this function when you have collected the caller's contact information (name, phone, email) and their inquiry details.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name":    {"type": "string", "description": "Caller's full name"},
+                            "phone":   {"type": "string", "description": "Caller's phone number"},
+                            "email":   {"type": "string", "description": "Caller's email address"},
+                            "inquiry": {"type": "string", "description": "Brief description of what they need"},
+                            "message": {"type": "string", "description": "Any additional message or notes"},
+                        },
+                        "required": ["name", "phone"],
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+        },
+    }
+    await openai_ws.send(json.dumps(session_update))
+    logger.info("Session update sent to OpenAI")
+
+
+async def send_initial_greeting(openai_ws):
+    """Send an initial conversation item to make Alex speak first."""
+    initial_item = {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Greet the caller warmly and professionally. Introduce yourself as Alex from Cascade RV Solar Solutions and ask how you can help them today. Keep it brief — one or two sentences.",
+                }
+            ],
+        },
+    }
+    await openai_ws.send(json.dumps(initial_item))
+    await openai_ws.send(json.dumps({"type": "response.create"}))
+    logger.info("Initial greeting triggered")
+
+
+# ── Leads dashboard ───────────────────────────────────────────────────────────
 
 @app.get("/leads", response_class=HTMLResponse)
 async def get_leads():
@@ -824,22 +711,7 @@ async def get_leads():
     """
 
 
-@app.post("/call-status")
-async def call_status(
-    CallSid: str = Form(...),
-    CallStatus: str = Form(default=""),
-):
-    """Handle call status callbacks — clean up conversation on completion."""
-    logger.info(f"Call {CallSid} status: {CallStatus}")
-    if CallStatus in ("completed", "failed", "busy", "no-answer", "canceled"):
-        if CallSid in conversations:
-            del conversations[CallSid]
-    return Response(content="OK", media_type="text/plain")
-
-
-# ─────────────────────────────────────────────
-# Run
-# ─────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
