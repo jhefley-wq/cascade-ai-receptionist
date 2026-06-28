@@ -20,6 +20,9 @@ from typing import Optional
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse
 import openai
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from dotenv import load_dotenv
 
@@ -33,10 +36,11 @@ app = FastAPI(title="Cascade RV Solar Solutions — AI Receptionist")
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OWNER_PHONE    = os.getenv("OWNER_PHONE", "+15039190521")
-OWNER_EMAIL    = os.getenv("OWNER_EMAIL", "jhefley@cascadesolarrvsolutions.com")
-BUSINESS_NAME  = "Cascade RV Solar Solutions"
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+OWNER_PHONE     = os.getenv("OWNER_PHONE", "+15039190521")
+OWNER_EMAIL     = os.getenv("OWNER_EMAIL", "jhefley@cascadesolarrvsolutions.com")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+BUSINESS_NAME   = "Cascade RV Solar Solutions"
 
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
@@ -197,8 +201,63 @@ def get_ai_response(call_sid: str, user_input: str) -> tuple[str, Optional[dict]
     return spoken_response, lead_data
 
 
+def send_lead_email(lead_entry: dict):
+    """Send an instant email notification to Jason when a lead is captured."""
+    if not SENDGRID_API_KEY:
+        logger.warning("No SENDGRID_API_KEY set — skipping email notification")
+        return
+    try:
+        name     = lead_entry.get("name", "Not provided")
+        phone    = lead_entry.get("phone", lead_entry.get("caller_number", "Not provided"))
+        email    = lead_entry.get("email", "Not provided")
+        inquiry  = lead_entry.get("inquiry", "Not provided")
+        message  = lead_entry.get("message", "Not provided")
+        timestamp = lead_entry.get("timestamp", datetime.now().isoformat())
+
+        subject = f"📞 New Lead from AI Receptionist — {name}"
+        body = f"""New lead captured by your AI Receptionist!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CALLER INFORMATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Name:     {name}
+Phone:    {phone}
+Email:    {email}
+Inquiry:  {inquiry}
+Message:  {message}
+Time:     {timestamp}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Log in to your dashboard to view all leads.
+
+— Cascade RV Solar Solutions AI Receptionist"""
+
+        import urllib.request
+        import urllib.parse
+        payload = json.dumps({
+            "personalizations": [{"to": [{"email": OWNER_EMAIL}]}],
+            "from": {"email": "receptionist@cascadesolarrvsolutions.com", "name": "Alex — AI Receptionist"},
+            "subject": subject,
+            "content": [{"type": "text/plain", "value": body}]
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.sendgrid.com/v3/mail/send",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            logger.info(f"Lead email sent to {OWNER_EMAIL} — status {resp.status}")
+    except Exception as e:
+        logger.warning(f"Failed to send lead email: {e}")
+
+
 def save_lead(call_sid: str, from_number: str, lead_data: dict):
-    """Save captured lead data to file and log it."""
+    """Save captured lead data to file, memory, and send email notification."""
     lead_entry = {
         "timestamp": datetime.now().isoformat(),
         "call_sid": call_sid,
@@ -213,6 +272,9 @@ def save_lead(call_sid: str, from_number: str, lead_data: dict):
             f.write(json.dumps(lead_entry) + "\n")
     except Exception as e:
         logger.warning(f"Could not write lead to file: {e}")
+
+    # Send instant email notification
+    send_lead_email(lead_entry)
 
     logger.info(f"Lead captured: {lead_entry}")
 
