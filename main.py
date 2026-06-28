@@ -236,7 +236,7 @@ Log in to your dashboard to view all leads.
         import urllib.parse
         payload = json.dumps({
             "personalizations": [{"to": [{"email": OWNER_EMAIL}]}],
-            "from": {"email": "receptionist@cascadesolarrvsolutions.com", "name": "Alex — AI Receptionist"},
+            "from": {"email": "jhefley@cascadesolarrvsolutions.com", "name": "Alex — AI Receptionist"},
             "subject": subject,
             "content": [{"type": "text/plain", "value": body}]
         }).encode("utf-8")
