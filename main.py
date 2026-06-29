@@ -524,11 +524,24 @@ async def media_stream(websocket: WebSocket):
                                                 logger.info(f"Alex transcript (response.done fallback): {c['transcript'][:60]}")
 
                         # ── Transcript: Caller's words ───────────────────────
+                        # OpenAI sends this when Whisper finishes transcribing the caller's speech
                         elif etype == "conversation.item.input_audio_transcription.completed":
-                            t = msg.get("transcript", "")
+                            t = msg.get("transcript", "").strip()
                             if t:
                                 lead["transcript"].append(f"Caller: {t}")
-                                logger.info(f"Caller transcript captured: {t[:60]}")
+                                logger.info(f"Caller transcript captured: {t[:80]}")
+
+                        # Alternate event name used in some API versions
+                        elif etype == "input_audio_transcription.completed":
+                            t = msg.get("transcript", "").strip()
+                            if t:
+                                lead["transcript"].append(f"Caller: {t}")
+                                logger.info(f"Caller transcript (alt event) captured: {t[:80]}")
+
+                        # Catch-all: log any unhandled transcript-related events so we can
+                        # identify the correct event name from Railway logs if needed
+                        elif "transcript" in etype.lower() or "transcription" in etype.lower():
+                            logger.info(f"UNHANDLED transcript event [{etype}]: {str(msg)[:200]}") 
 
                         elif etype == "error":
                             logger.error(f"OpenAI error event: {msg.get('error')}")
@@ -601,7 +614,10 @@ async def _send_session_update(openai_ws):
                     "speed": 1.0,
                 },
             },
-            "input_audio_transcription": {"model": "whisper-1"},
+            "input_audio_transcription": {
+                "model": "whisper-1",
+                "language": "en",
+            },
         },
     }
     await openai_ws.send(json.dumps(session_update))
