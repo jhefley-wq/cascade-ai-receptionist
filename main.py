@@ -398,8 +398,13 @@ async def media_stream(websocket: WebSocket):
                         response = json.loads(openai_message)
                         event_type = response.get("type")
 
+                        # Log all event types to diagnose audio flow
+                        if event_type not in ("response.audio.delta", "input_audio_buffer.append"):
+                            logger.info(f"OpenAI event: {event_type}")
+
                         # Stream audio back to Twilio (convert PCM 24kHz → G.711 µ-law 8kHz)
                         if event_type == "response.audio.delta" and response.get("delta"):
+                            logger.info(f"Audio delta received: {len(response['delta'])} chars")
                             try:
                                 pcm_buffer += base64.b64decode(response["delta"])
                             except Exception:
