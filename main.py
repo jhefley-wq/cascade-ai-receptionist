@@ -389,6 +389,10 @@ async def media_stream(websocket: WebSocket):
 
             async def send_to_twilio():
                 nonlocal stream_sid
+                # Buffer to accumulate small PCM chunks before converting and sending
+                pcm_buffer = b""
+                # Send ~20ms of audio at a time: 24000 Hz * 2 bytes * 0.02s = 960 bytes
+                CHUNK_SIZE = 960
                 try:
                     async for openai_message in openai_ws:
                         response = json.loads(openai_message)
@@ -396,16 +400,42 @@ async def media_stream(websocket: WebSocket):
 
                         # Stream audio back to Twilio (convert PCM 24kHz → G.711 µ-law 8kHz)
                         if event_type == "response.audio.delta" and response.get("delta"):
-                            ulaw_b64 = pcm24k_to_ulaw8k(response["delta"])
-                            if ulaw_b64 and stream_sid:
+                            try:
+                                pcm_buffer += base64.b64decode(response["delta"])
+                            except Exception:
+                                pass
+                            # Send in chunks of CHUNK_SIZE bytes
+                            while len(pcm_buffer) >= CHUNK_SIZE and stream_sid:
+                                chunk = pcm_buffer[:CHUNK_SIZE]
+                                pcm_buffer = pcm_buffer[CHUNK_SIZE:]
                                 try:
+                                    # Downsample 24kHz PCM → 8kHz µ-law
+                                    pcm_8k, _ = audioop.ratecv(chunk, 2, 1, 24000, 8000, None)
+                                    ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
+                                    ulaw_b64 = base64.b64encode(ulaw_8k).decode("utf-8")
                                     await websocket.send_text(json.dumps({
                                         "event": "media",
                                         "streamSid": stream_sid,
                                         "media": {"payload": ulaw_b64},
                                     }))
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(f"Audio send error: {e}")
+
+                        # Flush remaining buffer at end of response
+                        elif event_type == "response.audio.done":
+                            if pcm_buffer and stream_sid:
+                                try:
+                                    pcm_8k, _ = audioop.ratecv(pcm_buffer, 2, 1, 24000, 8000, None)
+                                    ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
+                                    ulaw_b64 = base64.b64encode(ulaw_8k).decode("utf-8")
+                                    await websocket.send_text(json.dumps({
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": ulaw_b64},
+                                    }))
+                                except Exception as e:
+                                    logger.debug(f"Audio flush error: {e}")
+                                pcm_buffer = b""
 
                         # Barge-in: clear Twilio buffer when user starts speaking
                         elif event_type == "input_audio_buffer.speech_started":
