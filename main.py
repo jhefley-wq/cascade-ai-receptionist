@@ -138,6 +138,7 @@ def pcm24k_to_ulaw8k_bytes(pcm_bytes: bytes) -> bytes:
 app = FastAPI()
 receptionist_state = {"active": True, "toggled_at": "Never"}
 lead_data_store = []
+pending_calls: dict = {}  # call_sid -> caller phone number, set by /incoming-call
 
 
 # ── GPT-4o lead extraction (sync, runs in thread pool) ───────────────────────
@@ -285,6 +286,14 @@ async def toggle_receptionist(action: str = "on"):
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call(request: Request):
     host = request.headers.get("host", "")
+    # Capture caller number from Twilio's POST body before the WebSocket even opens
+    form = await request.form() if request.method == "POST" else {}
+    caller_from = form.get("From") or request.query_params.get("From", "")
+    call_sid    = form.get("CallSid") or request.query_params.get("CallSid", "")
+    if caller_from and call_sid:
+        pending_calls[call_sid] = caller_from
+        logger.info(f"Incoming call from {caller_from} (SID: {call_sid})")
+
     response = VoiceResponse()
     if not receptionist_state["active"]:
         response.say("Thank you for calling Cascade RV Solar Solutions. We are currently unavailable. "
@@ -342,14 +351,29 @@ async def media_stream(websocket: WebSocket):
                         event = data.get("event")
 
                         if event == "start":
-                            stream_sid = data["start"]["streamSid"]
-                            lead["call_sid"] = data["start"].get("callSid")
-                            caller = (data["start"].get("customParameters", {}).get("caller")
-                                      or data["start"].get("from"))
+                            start_data = data["start"]
+                            stream_sid = start_data["streamSid"]
+                            call_sid_val = start_data.get("callSid", "")
+                            lead["call_sid"] = call_sid_val
+                            # Log full payload to diagnose caller number location
+                            logger.info(f"START keys: {list(start_data.keys())}")
+                            logger.info(f"START customParameters: {start_data.get('customParameters')}")
+                            logger.info(f"START callSid: {call_sid_val}")
+                            # 1. Best source: captured from the /incoming-call POST body
+                            caller = pending_calls.pop(call_sid_val, None)
+                            # 2. Fallback: check every known field in the start payload
+                            if not caller:
+                                caller = (
+                                    start_data.get("customParameters", {}).get("caller")
+                                    or start_data.get("customParameters", {}).get("From")
+                                    or start_data.get("from")
+                                    or start_data.get("From")
+                                    or start_data.get("caller")
+                                )
                             if caller:
                                 lead["caller_number"] = caller
                                 lead["phone"] = caller
-                            logger.info(f"Stream started: {stream_sid} from {caller}")
+                            logger.info(f"Stream started: {stream_sid} caller={caller}")
 
                         elif event == "media":
                             pcm_b64 = ulaw8k_to_pcm24k(data["media"]["payload"])
