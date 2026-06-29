@@ -89,12 +89,20 @@ A: Yes, we offer financing through Enhancify. Jason can walk you through the opt
 Q: Do you work on all types of RVs?
 A: Yes — motorhomes, fifth wheels, travel trailers, toy haulers, and more.
 
-LEAD CAPTURE:
-When a caller wants a callback, consultation, or to leave a message, collect:
+LEAD CAPTURE & QUALIFICATION:
+When a caller wants a callback, consultation, or to leave a message, you MUST FIRST ask qualifying questions before asking for their contact info.
+Ask these naturally, one at a time:
+1. What type of RV do they have? (Motorhome, fifth wheel, travel trailer, etc.)
+2. What is the year, make, and model?
+3. What are they trying to achieve? (Boondocking, full-time living, running AC off-grid, etc.)
+4. What is their current electrical setup?
+5. What is their approximate budget range?
+6. Where are they located in Oregon?
+
+Only AFTER gathering this context, transition naturally to collecting their contact info:
 1. Their full name
 2. Best phone number to reach them
 3. Email address (optional but helpful)
-4. Brief description of what they need
 
 After collecting their info, confirm it back to them and let them know Jason will be in touch soon.
 
@@ -161,6 +169,11 @@ def send_lead_email(lead: dict):
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;width:120px;"><strong>Name</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('name','—')}</td></tr>
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Phone</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('phone','—')}</td></tr>
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Email</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('email','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>RV Details</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('rv_details','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Goals</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('goals','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Current Setup</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('current_setup','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Budget</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('budget','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Location</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('location','—')}</td></tr>
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Inquiry</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('inquiry','—')}</td></tr>
               <tr><td style="padding:10px;color:#666;"><strong>Message</strong></td><td style="padding:10px;">{lead.get('message','—')}</td></tr>
             </table>
@@ -310,11 +323,6 @@ async def incoming_call(request: Request):
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
-    response.say(
-        "Thank you for calling Cascade RV Solar Solutions. Please hold for just a moment.",
-        voice="Polly.Matthew-Neural",
-    )
-
     connect = Connect()
     connect.stream(url=f"wss://{host}/media-stream")
     response.append(connect)
@@ -335,6 +343,11 @@ async def media_stream(websocket: WebSocket):
         "name": None,
         "phone": None,
         "email": None,
+        "rv_details": None,
+        "goals": None,
+        "current_setup": None,
+        "budget": None,
+        "location": None,
         "inquiry": None,
         "message": None,
     }
@@ -362,11 +375,13 @@ async def media_stream(websocket: WebSocket):
                         if event == "start":
                             stream_sid = data["start"]["streamSid"]
                             call_lead["call_sid"] = data["start"].get("callSid")
-                            call_lead["caller_number"] = (
-                                data["start"].get("customParameters", {}).get("caller")
-                                or data["start"].get("from")
-                            )
-                            logger.info(f"Stream started: {stream_sid}")
+                            # Capture caller ID immediately on connect
+                            caller = data["start"].get("customParameters", {}).get("caller") or data["start"].get("from")
+                            if caller:
+                                call_lead["caller_number"] = caller
+                                # Set phone right away so it is always captured
+                                call_lead["phone"] = caller
+                            logger.info(f"Stream started: {stream_sid} from {caller}")
 
                         elif event == "media":
                             # Convert G.711 µ-law 8kHz → PCM 16-bit 24kHz
@@ -496,7 +511,7 @@ def _extract_lead_from_text(text: str, lead: dict):
 
 def _finalize_lead(lead: dict):
     """Save lead to store and send email if we got useful info."""
-    if lead.get("phone") or lead.get("email") or lead.get("name"):
+    if lead.get("phone") or lead.get("email") or lead.get("name") or lead.get("caller_number"):
         lead_data_store.append(lead)
         logger.info(f"Lead saved: {lead.get('name') or lead.get('caller_number')}")
         try:
@@ -525,8 +540,13 @@ async def _send_session_update(openai_ws):
                             "email":   {"type": "string", "description": "Caller's email address"},
                             "inquiry": {"type": "string", "description": "Brief description of what they need"},
                             "message": {"type": "string", "description": "Any additional notes"},
+                            "rv_details": {"type": "string", "description": "RV type, year, make, and model"},
+                            "goals": {"type": "string", "description": "What they are trying to achieve (e.g. boondocking, running AC)"},
+                            "current_setup": {"type": "string", "description": "Current electrical setup"},
+                            "budget": {"type": "string", "description": "Approximate budget range"},
+                            "location": {"type": "string", "description": "Location in Oregon"},
                         },
-                        "required": ["name", "phone"],
+                        "required": ["name", "phone", "rv_details", "goals", "budget", "location"],
                     },
                 }
             ],
@@ -592,8 +612,9 @@ async def get_leads():
             name = lead.get("name") or lead.get("caller_number", "Unknown")
             phone = lead.get("phone") or lead.get("caller_number", "—")
             email = lead.get("email") or "—"
-            inquiry = lead.get("inquiry") or "—"
-            message = lead.get("message") or "—"
+            rv_details = lead.get("rv_details") or "—"
+            goals = lead.get("goals") or "—"
+            budget = lead.get("budget") or "—"
             row_bg = "#1e293b" if i % 2 == 0 else "#162032"
             rows_html += f"""
             <tr style="background:{row_bg};">
@@ -601,8 +622,9 @@ async def get_leads():
                 <td><strong>{name}</strong></td>
                 <td>{phone}</td>
                 <td>{email}</td>
-                <td>{inquiry}</td>
-                <td style="max-width:200px;word-wrap:break-word;">{message}</td>
+                <td>{rv_details}</td>
+                <td>{goals}</td>
+                <td>{budget}</td>
             </tr>"""
 
     return f"""
@@ -644,8 +666,9 @@ async def get_leads():
                         <th>Name</th>
                         <th>Phone</th>
                         <th>Email</th>
-                        <th>Inquiry</th>
-                        <th>Message</th>
+                        <th>RV Details</th>
+                        <th>Goals</th>
+                        <th>Budget</th>
                     </tr>
                 </thead>
                 <tbody>
