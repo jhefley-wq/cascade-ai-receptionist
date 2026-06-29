@@ -399,11 +399,12 @@ async def media_stream(websocket: WebSocket):
                         event_type = response.get("type")
 
                         # Log all event types to diagnose audio flow
-                        if event_type not in ("response.audio.delta", "input_audio_buffer.append"):
+                        if event_type not in ("response.output_audio.delta", "input_audio_buffer.append"):
                             logger.info(f"OpenAI event: {event_type}")
 
                         # Stream audio back to Twilio (convert PCM 24kHz → G.711 µ-law 8kHz)
-                        if event_type == "response.audio.delta" and response.get("delta"):
+                        # GA API uses response.output_audio.delta (not response.audio.delta)
+                        if event_type == "response.output_audio.delta" and response.get("delta"):
                             logger.info(f"Audio delta received: {len(response['delta'])} chars")
                             try:
                                 pcm_buffer += base64.b64decode(response["delta"])
@@ -427,7 +428,7 @@ async def media_stream(websocket: WebSocket):
                                     logger.debug(f"Audio send error: {e}")
 
                         # Flush remaining buffer at end of response
-                        elif event_type == "response.audio.done":
+                        elif event_type == "response.output_audio.done":
                             if pcm_buffer and stream_sid:
                                 try:
                                     pcm_8k, _ = audioop.ratecv(pcm_buffer, 2, 1, 24000, 8000, None)
