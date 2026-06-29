@@ -427,12 +427,14 @@ async def media_stream(websocket: WebSocket):
                         logger.info(f"Stream started: {stream_sid}")
 
                     elif event == "media":
-                        if openai_ws.open:
+                        try:
                             audio_append = {
                                 "type": "input_audio_buffer.append",
                                 "audio": data["media"]["payload"],
                             }
                             await openai_ws.send(json.dumps(audio_append))
+                        except Exception:
+                            pass
 
                     elif event == "stop":
                         logger.info("Stream stopped")
