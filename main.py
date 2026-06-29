@@ -33,7 +33,7 @@ SENDGRID_API_KEY    = os.environ.get("SENDGRID_API_KEY", "")
 PORT                = int(os.environ.get("PORT", 8000))
 
 # ── OpenAI Realtime config ────────────────────────────────────────────────────
-OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2025-08-28"
 VOICE = "onyx"   # Deep, calm, professional American male
 
 SYSTEM_MESSAGE = """You are Alex, the professional AI receptionist for Cascade RV Solar Solutions, 
@@ -399,9 +399,8 @@ async def media_stream(websocket: WebSocket):
 
     async with websockets.connect(
         OPENAI_REALTIME_URL,
-        extra_headers={
+        additional_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
         },
     ) as openai_ws:
 
