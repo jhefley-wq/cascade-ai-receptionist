@@ -321,6 +321,7 @@ async def media_stream(websocket: WebSocket):
         "transcript":    [],   # ← always a list, never None
     }
     stream_sid = None
+    stop_event = asyncio.Event()  # signals send_to_twilio to exit when Twilio disconnects
 
     try:
         async with websockets.connect(
@@ -332,7 +333,7 @@ async def media_stream(websocket: WebSocket):
             await _send_session_update(openai_ws)
             await _send_initial_greeting(openai_ws)
 
-            # ── Twilio → OpenAI ──────────────────────────────────────────────
+            # ── Twilio → OpenAI ────────────────────────────────────
             async def receive_from_twilio():
                 nonlocal stream_sid
                 try:
@@ -366,6 +367,10 @@ async def media_stream(websocket: WebSocket):
                             break
                 except Exception as e:
                     logger.error(f"receive_from_twilio error: {e}")
+                finally:
+                    # Signal send_to_twilio to stop waiting on OpenAI
+                    stop_event.set()
+                    logger.info("stop_event set — send_to_twilio will exit")
 
             # ── OpenAI → Twilio ──────────────────────────────────────────────
             async def send_to_twilio():
@@ -374,6 +379,9 @@ async def media_stream(websocket: WebSocket):
                 CHUNK = 960  # ~20 ms at 24 kHz 16-bit mono
                 try:
                     async for raw in openai_ws:
+                        if stop_event.is_set():
+                            logger.info("stop_event detected — exiting send_to_twilio")
+                            break
                         msg = json.loads(raw)
                         etype = msg.get("type")
 
@@ -420,14 +428,24 @@ async def media_stream(websocket: WebSocket):
                             except Exception:
                                 pass
 
-                        # ── Transcript: Alex's words ─────────────────────────
+                        # ── Transcript: Alex's words (streaming delta events) ──
+                        elif etype == "response.output_audio_transcript.done":
+                            t = msg.get("transcript", "")
+                            if t:
+                                lead["transcript"].append(f"Alex: {t}")
+                                logger.info(f"Alex transcript captured ({len(t)} chars): {t[:60]}")
+
+                        # ── Also capture from response.done as fallback ───────
                         elif etype == "response.done":
                             for item in msg.get("response", {}).get("output", []):
                                 if item.get("type") == "message" and item.get("role") == "assistant":
                                     for c in item.get("content", []):
                                         if c.get("type") == "audio" and c.get("transcript"):
-                                            lead["transcript"].append(f"Alex: {c['transcript']}")
-                                            logger.info(f"Alex transcript captured ({len(c['transcript'])} chars)")
+                                            # Only add if not already captured via transcript.done
+                                            entry = f"Alex: {c['transcript']}"
+                                            if entry not in lead["transcript"]:
+                                                lead["transcript"].append(entry)
+                                                logger.info(f"Alex transcript (response.done fallback): {c['transcript'][:60]}")
 
                         # ── Transcript: Caller's words ───────────────────────
                         elif etype == "conversation.item.input_audio_transcription.completed":
@@ -443,28 +461,37 @@ async def media_stream(websocket: WebSocket):
                     logger.error(f"send_to_twilio error: {e}")
 
             # ── Run both tasks, then ALWAYS finalize ─────────────────────────
-            try:
-                await asyncio.gather(receive_from_twilio(), send_to_twilio())
-            except Exception as e:
-                logger.error(f"gather error: {e}")
-            finally:
-                logger.info(f"Call ended. Transcript lines: {len(lead['transcript'])}. Running GPT-4o extraction.")
-                # Run synchronous GPT-4o call in a thread so it completes before the handler exits
+            finalized = False
+
+            async def finalize():
+                nonlocal finalized
+                if finalized:
+                    return
+                finalized = True
+                logger.info(f"Finalizing lead. Transcript lines: {len(lead['transcript'])}")
                 loop = asyncio.get_event_loop()
                 extracted = await loop.run_in_executor(
                     None, _gpt4o_extract, lead["transcript"], lead.get("caller_number", "")
                 )
-                # Merge extracted fields (don't overwrite caller_number with GPT guess)
                 for key in ("name", "email", "rv_details", "goals", "current_setup", "location", "summary"):
                     if extracted.get(key):
                         lead[key] = extracted[key]
                 if extracted.get("phone"):
                     lead["phone"] = extracted["phone"]
-
-                # Always save and email
                 lead_data_store.append(lead)
                 logger.info(f"Lead saved: {lead.get('name') or lead.get('caller_number')}")
                 send_lead_email(lead)
+
+            try:
+                await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            except Exception as e:
+                logger.error(f"gather error: {e}")
+
+            # Finalize runs whether gather completed normally, raised, or was cancelled
+            try:
+                await finalize()
+            except Exception as fe:
+                logger.error(f"finalize error: {fe}")
 
     except Exception as e:
         logger.error(f"WebSocket session error: {e}")
