@@ -368,9 +368,13 @@ async def media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"receive_from_twilio error: {e}")
                 finally:
-                    # Signal send_to_twilio to stop waiting on OpenAI
+                    # Close the OpenAI WebSocket so send_to_twilio's async-for loop exits immediately
                     stop_event.set()
-                    logger.info("stop_event set — send_to_twilio will exit")
+                    logger.info("stop_event set — closing OpenAI WebSocket")
+                    try:
+                        await openai_ws.close()
+                    except Exception:
+                        pass
 
             # ── OpenAI → Twilio ──────────────────────────────────────────────
             async def send_to_twilio():
