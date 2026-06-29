@@ -1,15 +1,19 @@
 """
 Cascade RV Solar Solutions — AI Receptionist
-Uses OpenAI Realtime API + Twilio Media Streams for near-zero latency voice.
+Uses OpenAI Realtime API (GA) + Twilio Media Streams for near-zero latency voice.
+
+Audio pipeline:
+  Twilio → G.711 µ-law 8kHz → upsample to PCM 16-bit 24kHz → OpenAI Realtime API
+  OpenAI  → PCM 16-bit 24kHz → downsample to G.711 µ-law 8kHz → Twilio
 """
 
 import os
 import json
 import base64
 import asyncio
+import audioop
 import logging
 from datetime import datetime
-from typing import Optional
 
 import websockets
 from fastapi import FastAPI, WebSocket, Request
@@ -32,9 +36,9 @@ OWNER_EMAIL         = os.environ.get("OWNER_EMAIL", "jhefley@cascadesolarrvsolut
 SENDGRID_API_KEY    = os.environ.get("SENDGRID_API_KEY", "")
 PORT                = int(os.environ.get("PORT", 8000))
 
-# ── OpenAI Realtime config ────────────────────────────────────────────────────
+# ── OpenAI Realtime GA config ─────────────────────────────────────────────────
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2025-08-28"
-VOICE = "onyx"   # Deep, calm, professional American male
+VOICE = "echo"   # Deep, calm, professional male voice (GA API supported voices)
 
 SYSTEM_MESSAGE = """You are Alex, the professional AI receptionist for Cascade RV Solar Solutions, 
 a mobile RV solar installation company based in Prineville, Oregon, owned by Jason Hefley.
@@ -101,16 +105,37 @@ IMPORTANT RULES:
 - Keep answers brief and conversational
 - If the caller seems to be in an emergency (e.g., electrical issue, fire risk), advise them to call 911 or a licensed electrician immediately"""
 
-LOG_EVENT_TYPES = [
-    "error",
-    "response.content.done",
-    "rate_limits.updated",
-    "response.done",
-    "input_audio_buffer.committed",
-    "input_audio_buffer.speech_stopped",
-    "input_audio_buffer.speech_started",
-    "session.created",
-]
+# ── Audio conversion helpers ──────────────────────────────────────────────────
+# Twilio sends/receives G.711 µ-law at 8kHz.
+# OpenAI GA Realtime API uses PCM 16-bit signed little-endian at 24kHz.
+
+def ulaw8k_to_pcm24k(ulaw_b64: str) -> str:
+    """Convert base64 G.711 µ-law 8kHz → base64 PCM 16-bit 24kHz."""
+    try:
+        ulaw_bytes = base64.b64decode(ulaw_b64)
+        # µ-law → linear PCM 16-bit
+        pcm_8k = audioop.ulaw2lin(ulaw_bytes, 2)
+        # 8kHz → 24kHz (3x upsample)
+        pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
+        return base64.b64encode(pcm_24k).decode("utf-8")
+    except Exception as e:
+        logger.debug(f"ulaw→pcm error: {e}")
+        return ""
+
+
+def pcm24k_to_ulaw8k(pcm_b64: str) -> str:
+    """Convert base64 PCM 16-bit 24kHz → base64 G.711 µ-law 8kHz."""
+    try:
+        pcm_bytes = base64.b64decode(pcm_b64)
+        # 24kHz → 8kHz (3x downsample)
+        pcm_8k, _ = audioop.ratecv(pcm_bytes, 2, 1, 24000, 8000, None)
+        # linear PCM 16-bit → µ-law
+        ulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
+        return base64.b64encode(ulaw_8k).decode("utf-8")
+    except Exception as e:
+        logger.debug(f"pcm→ulaw error: {e}")
+        return ""
+
 
 # ── App state ─────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -198,121 +223,45 @@ async def dashboard():
                 width: 100%;
                 box-shadow: 0 25px 50px rgba(0,0,0,0.4);
             }}
-            .logo {{
-                font-size: 13px;
-                color: #64748b;
-                text-transform: uppercase;
-                letter-spacing: 2px;
-                margin-bottom: 8px;
-            }}
-            h1 {{
-                font-size: 24px;
-                font-weight: 700;
-                color: #f1f5f9;
-                margin-bottom: 32px;
-            }}
+            .logo {{ font-size: 13px; color: #64748b; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; }}
+            h1 {{ font-size: 24px; font-weight: 700; color: #f1f5f9; margin-bottom: 32px; }}
             .status-badge {{
-                display: inline-flex;
-                align-items: center;
-                gap: 10px;
-                background: #0f172a;
-                border-radius: 12px;
-                padding: 16px 24px;
-                margin-bottom: 32px;
-                width: 100%;
+                display: inline-flex; align-items: center; gap: 10px;
+                background: #0f172a; border-radius: 12px; padding: 16px 24px;
+                margin-bottom: 32px; width: 100%;
             }}
-            .dot {{
-                width: 14px;
-                height: 14px;
-                border-radius: 50%;
-                background: {status_color};
-                box-shadow: 0 0 10px {status_color};
-                flex-shrink: 0;
-            }}
-            .status-text {{
-                font-size: 15px;
-                font-weight: 600;
-                color: {status_color};
-            }}
-            .stats {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 16px;
-                margin-bottom: 32px;
-            }}
-            .stat {{
-                background: #0f172a;
-                border-radius: 10px;
-                padding: 16px;
-                text-align: center;
-            }}
-            .stat-number {{
-                font-size: 28px;
-                font-weight: 700;
-                color: #38bdf8;
-            }}
-            .stat-label {{
-                font-size: 12px;
-                color: #64748b;
-                margin-top: 4px;
-            }}
+            .dot {{ width: 14px; height: 14px; border-radius: 50%; background: {status_color}; box-shadow: 0 0 10px {status_color}; flex-shrink: 0; }}
+            .status-text {{ font-size: 15px; font-weight: 600; color: {status_color}; }}
+            .stats {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 32px; }}
+            .stat {{ background: #0f172a; border-radius: 10px; padding: 16px; text-align: center; }}
+            .stat-number {{ font-size: 28px; font-weight: 700; color: #38bdf8; }}
+            .stat-label {{ font-size: 12px; color: #64748b; margin-top: 4px; }}
             .toggle-btn {{
-                display: block;
-                width: 100%;
-                padding: 16px;
-                background: {btn_color};
-                color: white;
-                border: none;
-                border-radius: 12px;
-                font-size: 16px;
-                font-weight: 700;
-                cursor: pointer;
-                text-decoration: none;
-                text-align: center;
-                transition: opacity 0.2s;
-                margin-bottom: 16px;
+                display: block; width: 100%; padding: 16px; background: {btn_color};
+                color: white; border: none; border-radius: 12px; font-size: 16px;
+                font-weight: 700; cursor: pointer; text-decoration: none; text-align: center;
+                transition: opacity 0.2s; margin-bottom: 16px;
             }}
             .toggle-btn:hover {{ opacity: 0.85; }}
             .leads-btn {{
-                display: block;
-                width: 100%;
-                padding: 14px;
-                background: transparent;
-                color: #38bdf8;
-                border: 2px solid #38bdf8;
-                border-radius: 12px;
-                font-size: 15px;
-                font-weight: 600;
-                cursor: pointer;
-                text-decoration: none;
-                text-align: center;
-                transition: all 0.2s;
+                display: block; width: 100%; padding: 14px; background: transparent;
+                color: #38bdf8; border: 2px solid #38bdf8; border-radius: 12px;
+                font-size: 15px; font-weight: 600; cursor: pointer; text-decoration: none;
+                text-align: center; transition: all 0.2s;
             }}
             .leads-btn:hover {{ background: #38bdf820; }}
-            .footer {{
-                margin-top: 24px;
-                font-size: 12px;
-                color: #475569;
-                text-align: center;
-            }}
-            .toggled-at {{
-                font-size: 12px;
-                color: #475569;
-                margin-top: 12px;
-                text-align: center;
-            }}
+            .footer {{ margin-top: 24px; font-size: 12px; color: #475569; text-align: center; }}
+            .toggled-at {{ font-size: 12px; color: #475569; margin-top: 12px; text-align: center; }}
         </style>
     </head>
     <body>
         <div class="card">
             <div class="logo">Cascade RV Solar Solutions</div>
             <h1>AI Receptionist Dashboard</h1>
-
             <div class="status-badge">
                 <div class="dot"></div>
                 <div class="status-text">{status_text}</div>
             </div>
-
             <div class="stats">
                 <div class="stat">
                     <div class="stat-number">{lead_count}</div>
@@ -323,14 +272,10 @@ async def dashboard():
                     <div class="stat-label">Voice Engine</div>
                 </div>
             </div>
-
             <a href="/toggle?action={btn_action}" class="toggle-btn">{btn_label}</a>
             <a href="/leads" class="leads-btn">View Captured Leads</a>
-
             <div class="toggled-at">Last toggled: {toggled_at}</div>
-            <div class="footer">
-                (503) 919-0521 &nbsp;·&nbsp; Prineville, OR &nbsp;·&nbsp; cascadesolarrvsolutions.com
-            </div>
+            <div class="footer">(503) 919-0521 &nbsp;·&nbsp; Prineville, OR &nbsp;·&nbsp; cascadesolarrvsolutions.com</div>
         </div>
     </body>
     </html>
@@ -342,8 +287,7 @@ async def toggle_receptionist(action: str = "on"):
     """Toggle the receptionist ON or OFF."""
     receptionist_state["active"] = (action.lower() == "on")
     receptionist_state["toggled_at"] = datetime.now().strftime("%Y-%m-%d %I:%M %p")
-    status = "ACTIVE" if receptionist_state["active"] else "INACTIVE"
-    logger.info(f"Receptionist toggled: {status}")
+    logger.info(f"Receptionist toggled: {'ACTIVE' if receptionist_state['active'] else 'INACTIVE'}")
     return Response(
         content='<html><head><meta http-equiv="refresh" content="0;url=/"></head></html>',
         media_type="text/html",
@@ -380,11 +324,10 @@ async def incoming_call(request: Request):
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    """WebSocket endpoint bridging Twilio Media Streams ↔ OpenAI Realtime API."""
+    """WebSocket endpoint bridging Twilio Media Streams ↔ OpenAI Realtime API (GA)."""
     await websocket.accept()
     logger.info("Twilio Media Stream connected")
 
-    # Per-call lead tracking
     call_lead = {
         "timestamp": datetime.utcnow().isoformat(),
         "call_sid": None,
@@ -397,107 +340,119 @@ async def media_stream(websocket: WebSocket):
     }
     stream_sid = None
 
-    async with websockets.connect(
-        OPENAI_REALTIME_URL,
-        additional_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-        },
-    ) as openai_ws:
+    try:
+        async with websockets.connect(
+            OPENAI_REALTIME_URL,
+            additional_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            },
+            open_timeout=15,
+        ) as openai_ws:
 
-        await send_session_update(openai_ws)
-        # Send initial greeting
-        await send_initial_greeting(openai_ws)
+            await _send_session_update(openai_ws)
+            await _send_initial_greeting(openai_ws)
 
-        async def receive_from_twilio():
-            """Receive audio from Twilio and forward to OpenAI."""
-            nonlocal stream_sid
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    event = data.get("event")
+            async def receive_from_twilio():
+                nonlocal stream_sid
+                try:
+                    async for message in websocket.iter_text():
+                        data = json.loads(message)
+                        event = data.get("event")
 
-                    if event == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        call_lead["call_sid"] = data["start"].get("callSid")
-                        call_lead["caller_number"] = (
-                            data["start"].get("customParameters", {}).get("caller")
-                            or data["start"].get("from")
-                        )
-                        logger.info(f"Stream started: {stream_sid}")
+                        if event == "start":
+                            stream_sid = data["start"]["streamSid"]
+                            call_lead["call_sid"] = data["start"].get("callSid")
+                            call_lead["caller_number"] = (
+                                data["start"].get("customParameters", {}).get("caller")
+                                or data["start"].get("from")
+                            )
+                            logger.info(f"Stream started: {stream_sid}")
 
-                    elif event == "media":
-                        try:
-                            audio_append = {
-                                "type": "input_audio_buffer.append",
-                                "audio": data["media"]["payload"],
-                            }
-                            await openai_ws.send(json.dumps(audio_append))
-                        except Exception:
-                            pass
+                        elif event == "media":
+                            # Convert G.711 µ-law 8kHz → PCM 16-bit 24kHz
+                            ulaw_b64 = data["media"]["payload"]
+                            pcm_b64 = ulaw8k_to_pcm24k(ulaw_b64)
+                            if pcm_b64:
+                                try:
+                                    await openai_ws.send(json.dumps({
+                                        "type": "input_audio_buffer.append",
+                                        "audio": pcm_b64,
+                                    }))
+                                except Exception:
+                                    pass
 
-                    elif event == "stop":
-                        logger.info("Stream stopped")
-                        break
-            except Exception as e:
-                logger.error(f"Error receiving from Twilio: {e}")
+                        elif event == "stop":
+                            logger.info("Stream stopped")
+                            break
+                except Exception as e:
+                    logger.error(f"Error receiving from Twilio: {e}")
 
-        async def send_to_twilio():
-            """Receive responses from OpenAI and forward audio to Twilio."""
-            nonlocal stream_sid
-            try:
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
-                    event_type = response.get("type")
+            async def send_to_twilio():
+                nonlocal stream_sid
+                try:
+                    async for openai_message in openai_ws:
+                        response = json.loads(openai_message)
+                        event_type = response.get("type")
 
-                    if event_type in LOG_EVENT_TYPES:
-                        logger.info(f"OpenAI event: {event_type}")
+                        # Stream audio back to Twilio (convert PCM 24kHz → G.711 µ-law 8kHz)
+                        if event_type == "response.audio.delta" and response.get("delta"):
+                            ulaw_b64 = pcm24k_to_ulaw8k(response["delta"])
+                            if ulaw_b64 and stream_sid:
+                                try:
+                                    await websocket.send_text(json.dumps({
+                                        "event": "media",
+                                        "streamSid": stream_sid,
+                                        "media": {"payload": ulaw_b64},
+                                    }))
+                                except Exception:
+                                    pass
 
-                    # Stream audio back to Twilio
-                    if event_type == "response.audio.delta" and response.get("delta"):
-                        audio_delta = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": response["delta"]},
-                        }
-                        await websocket.send_text(json.dumps(audio_delta))
+                        # Barge-in: clear Twilio buffer when user starts speaking
+                        elif event_type == "input_audio_buffer.speech_started":
+                            logger.info("Barge-in detected — clearing audio buffer")
+                            if stream_sid:
+                                try:
+                                    await websocket.send_text(json.dumps({
+                                        "event": "clear",
+                                        "streamSid": stream_sid,
+                                    }))
+                                except Exception:
+                                    pass
 
-                    # Interrupt handling — clear buffer when user starts speaking
-                    if event_type == "input_audio_buffer.speech_started":
-                        logger.info("Speech detected — clearing buffer")
-                        await websocket.send_text(json.dumps({
-                            "event": "clear",
-                            "streamSid": stream_sid,
-                        }))
+                        # Extract lead info from transcript
+                        elif event_type == "response.done":
+                            output = response.get("response", {}).get("output", [])
+                            for item in output:
+                                if item.get("type") == "message":
+                                    for content in item.get("content", []):
+                                        if content.get("type") in ("text", "transcript"):
+                                            _extract_lead_from_text(
+                                                content.get("text", content.get("transcript", "")).lower(),
+                                                call_lead,
+                                            )
 
-                    # Extract lead info from conversation transcript
-                    if event_type == "response.done":
-                        output = response.get("response", {}).get("output", [])
-                        for item in output:
-                            if item.get("type") == "message":
-                                for content in item.get("content", []):
-                                    if content.get("type") == "text":
-                                        text = content.get("text", "").lower()
-                                        _extract_lead_from_text(text, call_lead)
+                        elif event_type == "error":
+                            logger.error(f"OpenAI error: {response.get('error')}")
 
-            except Exception as e:
-                logger.error(f"Error sending to Twilio: {e}")
-            finally:
-                # Save lead if we captured any info
-                _finalize_lead(call_lead)
+                except Exception as e:
+                    logger.error(f"Error sending to Twilio: {e}")
+                finally:
+                    _finalize_lead(call_lead)
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
-    logger.info("WebSocket session closed")
+    except Exception as e:
+        logger.error(f"WebSocket session error: {e}")
+    finally:
+        logger.info("WebSocket session closed")
 
 
 def _extract_lead_from_text(text: str, lead: dict):
-    """Simple heuristic extraction of lead info from AI transcript."""
+    """Heuristic extraction of lead info from AI transcript."""
     import re
-    # Phone numbers
     phones = re.findall(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", text)
     if phones and not lead["phone"]:
         lead["phone"] = phones[0]
-    # Emails
     emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
     if emails and not lead["email"]:
         lead["email"] = emails[0]
@@ -514,23 +469,18 @@ def _finalize_lead(lead: dict):
             logger.error(f"Email error: {e}")
 
 
-async def send_session_update(openai_ws):
-    """Send session configuration to OpenAI Realtime API."""
+async def _send_session_update(openai_ws):
+    """Send session configuration to OpenAI Realtime API (GA schema)."""
     session_update = {
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad"},
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "voice": VOICE,
+            "type": "realtime",
             "instructions": SYSTEM_MESSAGE,
-            "modalities": ["text", "audio"],
-            "temperature": 0.7,
             "tools": [
                 {
                     "type": "function",
                     "name": "capture_lead",
-                    "description": "Call this function when you have collected the caller's contact information (name, phone, email) and their inquiry details.",
+                    "description": "Call this when you have collected the caller's contact information.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -538,21 +488,39 @@ async def send_session_update(openai_ws):
                             "phone":   {"type": "string", "description": "Caller's phone number"},
                             "email":   {"type": "string", "description": "Caller's email address"},
                             "inquiry": {"type": "string", "description": "Brief description of what they need"},
-                            "message": {"type": "string", "description": "Any additional message or notes"},
+                            "message": {"type": "string", "description": "Any additional notes"},
                         },
                         "required": ["name", "phone"],
                     },
                 }
             ],
             "tool_choice": "auto",
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 600,
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "voice": VOICE,
+                    "speed": 1.0,
+                },
+            },
         },
     }
     await openai_ws.send(json.dumps(session_update))
-    logger.info("Session update sent to OpenAI")
+    logger.info("Session update sent to OpenAI Realtime API (GA)")
 
 
-async def send_initial_greeting(openai_ws):
-    """Send an initial conversation item to make Alex speak first."""
+async def _send_initial_greeting(openai_ws):
+    """Trigger Alex to speak first when the call connects."""
     initial_item = {
         "type": "conversation.item.create",
         "item": {
@@ -561,7 +529,7 @@ async def send_initial_greeting(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the caller warmly and professionally. Introduce yourself as Alex from Cascade RV Solar Solutions and ask how you can help them today. Keep it brief — one or two sentences.",
+                    "text": "Greet the caller warmly and professionally. Introduce yourself as Alex from Cascade RV Solar Solutions and ask how you can help them today. Keep it to one or two sentences.",
                 }
             ],
         },
@@ -609,76 +577,18 @@ async def get_leads():
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                background: #0f172a;
-                color: #e2e8f0;
-                min-height: 100vh;
-                padding: 30px 20px;
-            }}
-            .header {{
-                max-width: 1100px;
-                margin: 0 auto 24px;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                flex-wrap: wrap;
-                gap: 12px;
-            }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 30px 20px; }}
+            .header {{ max-width: 1100px; margin: 0 auto 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }}
             .header h1 {{ font-size: 22px; font-weight: 700; color: #f1f5f9; }}
             .header .sub {{ font-size: 13px; color: #64748b; margin-top: 4px; }}
-            .back-btn {{
-                padding: 10px 20px;
-                background: #1e293b;
-                color: #38bdf8;
-                border: 2px solid #38bdf8;
-                border-radius: 10px;
-                text-decoration: none;
-                font-size: 14px;
-                font-weight: 600;
-            }}
+            .back-btn {{ padding: 10px 20px; background: #1e293b; color: #38bdf8; border: 2px solid #38bdf8; border-radius: 10px; text-decoration: none; font-size: 14px; font-weight: 600; }}
             .back-btn:hover {{ background: #38bdf820; }}
-            .badge {{
-                display: inline-block;
-                background: #38bdf820;
-                color: #38bdf8;
-                border-radius: 20px;
-                padding: 4px 14px;
-                font-size: 13px;
-                font-weight: 700;
-                margin-left: 12px;
-            }}
-            .table-wrap {{
-                max-width: 1100px;
-                margin: 0 auto;
-                overflow-x: auto;
-                border-radius: 14px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.4);
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 14px;
-            }}
-            thead tr {{
-                background: #0f172a;
-            }}
-            thead th {{
-                padding: 14px 16px;
-                text-align: left;
-                color: #64748b;
-                font-size: 11px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                font-weight: 600;
-                white-space: nowrap;
-            }}
-            tbody td {{
-                padding: 14px 16px;
-                color: #cbd5e1;
-                vertical-align: top;
-                border-top: 1px solid #1e293b;
-            }}
+            .badge {{ display: inline-block; background: #38bdf820; color: #38bdf8; border-radius: 20px; padding: 4px 14px; font-size: 13px; font-weight: 700; margin-left: 12px; }}
+            .table-wrap {{ max-width: 1100px; margin: 0 auto; overflow-x: auto; border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,0.4); }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+            thead tr {{ background: #0f172a; }}
+            thead th {{ padding: 14px 16px; text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; white-space: nowrap; }}
+            tbody td {{ padding: 14px 16px; color: #cbd5e1; vertical-align: top; border-top: 1px solid #1e293b; }}
             tbody tr:hover td {{ background: #1e3a5f !important; }}
         </style>
     </head>
