@@ -96,8 +96,7 @@ Ask these naturally, one at a time:
 2. What is the year, make, and model?
 3. What are they trying to achieve? (Boondocking, full-time living, running AC off-grid, etc.)
 4. What is their current electrical setup?
-5. What is their approximate budget range?
-6. Where are they located in Oregon?
+5. Where are they located in Oregon?
 
 Only AFTER gathering this context, transition naturally to collecting their contact info:
 1. Their full name
@@ -475,40 +474,20 @@ async def media_stream(websocket: WebSocket):
                                 except Exception:
                                     pass
 
-                        # Extract lead info from transcript and function calls
+                        # Capture AI's transcript responses
                         elif event_type == "response.done":
                             output = response.get("response", {}).get("output", [])
                             for item in output:
-                                if item.get("type") == "message":
+                                if item.get("type") == "message" and item.get("role") == "assistant":
                                     for content in item.get("content", []):
-                                        if content.get("type") in ("text", "transcript"):
-                                            _extract_lead_from_text(
-                                                content.get("text", content.get("transcript", "")).lower(),
-                                                call_lead,
-                                            )
-                                # Handle capture_lead function call — this is the primary lead capture path
-                                elif item.get("type") == "function_call" and item.get("name") == "capture_lead":
-                                    try:
-                                        args = json.loads(item.get("arguments", "{}"))
-                                        logger.info(f"capture_lead tool called: {args}")
-                                        for field in ("name", "phone", "email", "inquiry", "message",
-                                                      "rv_details", "goals", "current_setup", "budget", "location"):
-                                            if args.get(field):
-                                                call_lead[field] = args[field]
-                                        # Send tool result back so Alex can continue the conversation
-                                        await openai_ws.send(json.dumps({
-                                            "type": "conversation.item.create",
-                                            "item": {
-                                                "type": "function_call_output",
-                                                "call_id": item.get("call_id"),
-                                                "output": json.dumps({"status": "saved"}),
-                                            },
-                                        }))
-                                        await openai_ws.send(json.dumps({"type": "response.create"}))
-                                        # Send email immediately when lead is captured
-                                        _finalize_lead(call_lead)
-                                    except Exception as e:
-                                        logger.error(f"capture_lead tool error: {e}")
+                                        if content.get("type") == "audio" and content.get("transcript"):
+                                            call_lead["transcript"].append(f"Alex: {content['transcript']}")
+
+                        # Capture Caller's transcript
+                        elif event_type == "conversation.item.input_audio_transcription.completed":
+                            transcript = response.get("transcript", "")
+                            if transcript:
+                                call_lead["transcript"].append(f"Caller: {transcript}")
 
                         elif event_type == "error":
                             logger.error(f"OpenAI error: {response.get('error')}")
@@ -522,8 +501,9 @@ async def media_stream(websocket: WebSocket):
                 logger.error(f"gather error: {e}")
             finally:
                 # Always fires — even on abrupt hang-up or task cancellation
-                logger.info("Call ended — finalizing lead")
-                _finalize_lead(call_lead)
+                logger.info("Call ended — finalizing lead via GPT-4o")
+                # Run the GPT-4o summary extraction in the background so it doesn't block the WebSocket close
+                asyncio.create_task(_extract_and_finalize_lead(call_lead))
 
     except Exception as e:
         logger.error(f"WebSocket session error: {e}")
@@ -531,29 +511,60 @@ async def media_stream(websocket: WebSocket):
         logger.info("WebSocket session closed")
 
 
-def _extract_lead_from_text(text: str, lead: dict):
-    """Heuristic extraction of lead info from AI transcript."""
-    import re
-    phones = re.findall(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b", text)
-    if phones and not lead["phone"]:
-        lead["phone"] = phones[0]
-    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
-    if emails and not lead["email"]:
-        lead["email"] = emails[0]
-
-
-def _finalize_lead(lead: dict):
-    """Save lead to store and send email if we got useful info. Idempotent — only runs once per call."""
+async def _extract_and_finalize_lead(lead: dict):
+    """Use GPT-4o to analyze the full transcript, extract fields, and send email."""
     if lead.get("_email_sent"):
         return
-    if lead.get("phone") or lead.get("email") or lead.get("name") or lead.get("caller_number"):
-        lead["_email_sent"] = True
-        lead_data_store.append(lead)
-        logger.info(f"Lead saved: {lead.get('name') or lead.get('caller_number')}")
+    lead["_email_sent"] = True
+
+    transcript_text = "\n".join(lead.get("transcript", []))
+    if transcript_text.strip():
         try:
-            send_lead_email(lead)
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            prompt = f"""
+            Analyze the following phone conversation transcript between an AI receptionist (Alex) and a caller.
+            Extract the following information if provided by the caller. If not provided, leave as null.
+            Return a JSON object with these exact keys:
+            - name: Caller's name
+            - phone: Caller's phone number (if they explicitly said it, otherwise null)
+            - email: Caller's email address
+            - rv_details: Type, year, make, model of their RV
+            - goals: What they want to achieve (e.g., boondocking, off-grid AC)
+            - current_setup: Their current electrical setup
+            - location: Their location in Oregon
+            - summary: A concise 2-3 sentence summary of the caller's needs and the outcome of the call.
+
+            Transcript:
+            {transcript_text}
+            """
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(response.choices[0].message.content)
+            
+            # Merge extracted data into the lead dictionary
+            for key in ["name", "email", "rv_details", "goals", "current_setup", "location", "summary"]:
+                if data.get(key):
+                    lead[key] = data[key]
+            
+            # Only override phone if they explicitly provided a different one than caller ID
+            if data.get("phone"):
+                lead["phone"] = data["phone"]
+
+            logger.info(f"GPT-4o extraction successful for {lead.get('caller_number')}")
         except Exception as e:
-            logger.error(f"Email error: {e}")
+            logger.error(f"GPT-4o extraction error: {e}")
+            lead["summary"] = "Error extracting summary from transcript. See logs."
+
+    # Always save and email, even if transcript was empty (we still have caller ID)
+    lead_data_store.append(lead)
+    logger.info(f"Lead saved: {lead.get('name') or lead.get('caller_number')}")
+    try:
+        send_lead_email(lead)
+    except Exception as e:
+        logger.error(f"Email error: {e}")
 
 
 async def _send_session_update(openai_ws):
@@ -563,30 +574,8 @@ async def _send_session_update(openai_ws):
         "session": {
             "type": "realtime",
             "instructions": SYSTEM_MESSAGE,
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "capture_lead",
-                    "description": "Call this when you have collected the caller's contact information.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name":    {"type": "string", "description": "Caller's full name"},
-                            "phone":   {"type": "string", "description": "Caller's phone number"},
-                            "email":   {"type": "string", "description": "Caller's email address"},
-                            "inquiry": {"type": "string", "description": "Brief description of what they need"},
-                            "message": {"type": "string", "description": "Any additional notes"},
-                            "rv_details": {"type": "string", "description": "RV type, year, make, and model"},
-                            "goals": {"type": "string", "description": "What they are trying to achieve (e.g. boondocking, running AC)"},
-                            "current_setup": {"type": "string", "description": "Current electrical setup"},
-                            "budget": {"type": "string", "description": "Approximate budget range"},
-                            "location": {"type": "string", "description": "Location in Oregon"},
-                        },
-                        "required": ["name", "phone", "rv_details", "goals", "budget", "location"],
-                    },
-                }
-            ],
-            "tool_choice": "auto",
+            "tools": [],
+            "tool_choice": "none",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
@@ -605,10 +594,14 @@ async def _send_session_update(openai_ws):
                     "speed": 1.0,
                 },
             },
+            "input_audio_transcription": {
+                "model": "whisper-1"
+            }
         },
     }
     await openai_ws.send(json.dumps(session_update))
     logger.info("Session update sent to OpenAI Realtime API (GA)")
+
 
 
 async def _send_initial_greeting(openai_ws):
