@@ -470,7 +470,7 @@ async def media_stream(websocket: WebSocket):
                                 except Exception:
                                     pass
 
-                        # Extract lead info from transcript
+                        # Extract lead info from transcript and function calls
                         elif event_type == "response.done":
                             output = response.get("response", {}).get("output", [])
                             for item in output:
@@ -481,6 +481,29 @@ async def media_stream(websocket: WebSocket):
                                                 content.get("text", content.get("transcript", "")).lower(),
                                                 call_lead,
                                             )
+                                # Handle capture_lead function call — this is the primary lead capture path
+                                elif item.get("type") == "function_call" and item.get("name") == "capture_lead":
+                                    try:
+                                        args = json.loads(item.get("arguments", "{}"))
+                                        logger.info(f"capture_lead tool called: {args}")
+                                        for field in ("name", "phone", "email", "inquiry", "message",
+                                                      "rv_details", "goals", "current_setup", "budget", "location"):
+                                            if args.get(field):
+                                                call_lead[field] = args[field]
+                                        # Send tool result back so Alex can continue the conversation
+                                        await openai_ws.send(json.dumps({
+                                            "type": "conversation.item.create",
+                                            "item": {
+                                                "type": "function_call_output",
+                                                "call_id": item.get("call_id"),
+                                                "output": json.dumps({"status": "saved"}),
+                                            },
+                                        }))
+                                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                                        # Send email immediately when lead is captured
+                                        _finalize_lead(call_lead)
+                                    except Exception as e:
+                                        logger.error(f"capture_lead tool error: {e}")
 
                         elif event_type == "error":
                             logger.error(f"OpenAI error: {response.get('error')}")
@@ -488,7 +511,10 @@ async def media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Error sending to Twilio: {e}")
                 finally:
-                    _finalize_lead(call_lead)
+                    # Always attempt to send email on call end (covers early hang-up cases)
+                    # Only send if not already sent by capture_lead tool
+                    if not call_lead.get("_email_sent"):
+                        _finalize_lead(call_lead)
 
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
@@ -510,8 +536,11 @@ def _extract_lead_from_text(text: str, lead: dict):
 
 
 def _finalize_lead(lead: dict):
-    """Save lead to store and send email if we got useful info."""
+    """Save lead to store and send email if we got useful info. Idempotent — only runs once per call."""
+    if lead.get("_email_sent"):
+        return
     if lead.get("phone") or lead.get("email") or lead.get("name") or lead.get("caller_number"):
+        lead["_email_sent"] = True
         lead_data_store.append(lead)
         logger.info(f"Lead saved: {lead.get('name') or lead.get('caller_number')}")
         try:
