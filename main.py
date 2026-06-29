@@ -166,7 +166,8 @@ def send_lead_email(lead: dict):
           </div>
           <div style="background:white;padding:24px;border-radius:0 0 8px 8px;">
             <table style="width:100%;border-collapse:collapse;">
-              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;width:120px;"><strong>Name</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('name','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;width:140px;"><strong>Caller ID</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('caller_number','—')}</td></tr>
+              <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Name</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('name','—')}</td></tr>
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Phone</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('phone','—')}</td></tr>
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>Email</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('email','—')}</td></tr>
               <tr><td style="padding:10px;border-bottom:1px solid #eee;color:#666;"><strong>RV Details</strong></td><td style="padding:10px;border-bottom:1px solid #eee;">{lead.get('rv_details','—')}</td></tr>
@@ -183,10 +184,15 @@ def send_lead_email(lead: dict):
           <p style="text-align:center;margin-top:16px;font-size:12px;color:#aaa;">— Cascade RV Solar Solutions AI Receptionist</p>
         </div>
         """
+        # Determine subject based on how much info was captured
+        if lead.get("name"):
+            subject = f"New Lead: {lead['name']} — Cascade RV Solar Solutions"
+        else:
+            subject = f"Missed/Partial Call: {lead.get('caller_number', 'Unknown')} — Cascade RV Solar Solutions"
         message = Mail(
             from_email=OWNER_EMAIL,
             to_emails=OWNER_EMAIL,
-            subject=f"New Lead: {lead.get('name', 'Unknown Caller')} — Cascade RV Solar",
+            subject=subject,
             html_content=html,
         )
         sg = SendGridAPIClient(SENDGRID_API_KEY)
@@ -379,7 +385,6 @@ async def media_stream(websocket: WebSocket):
                             caller = data["start"].get("customParameters", {}).get("caller") or data["start"].get("from")
                             if caller:
                                 call_lead["caller_number"] = caller
-                                # Set phone right away so it is always captured
                                 call_lead["phone"] = caller
                             logger.info(f"Stream started: {stream_sid} from {caller}")
 
@@ -510,13 +515,15 @@ async def media_stream(websocket: WebSocket):
 
                 except Exception as e:
                     logger.error(f"Error sending to Twilio: {e}")
-                finally:
-                    # Always attempt to send email on call end (covers early hang-up cases)
-                    # Only send if not already sent by capture_lead tool
-                    if not call_lead.get("_email_sent"):
-                        _finalize_lead(call_lead)
 
-            await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            try:
+                await asyncio.gather(receive_from_twilio(), send_to_twilio())
+            except Exception as e:
+                logger.error(f"gather error: {e}")
+            finally:
+                # Always fires — even on abrupt hang-up or task cancellation
+                logger.info("Call ended — finalizing lead")
+                _finalize_lead(call_lead)
 
     except Exception as e:
         logger.error(f"WebSocket session error: {e}")
