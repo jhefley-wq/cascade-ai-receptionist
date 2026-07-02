@@ -527,15 +527,22 @@ async def media_stream(websocket: WebSocket):
                         # ── Transcript: Caller's words ───────────────────────
                         elif etype == "conversation.item.created":
                             item = msg.get("item", {})
+                            # Log full item so we can see exact structure in Railway logs
+                            logger.info(f"conversation.item.created role={item.get('role')} content={str(item.get('content',''))[:300]}")
                             if item.get("role") == "user":
                                 content = item.get("content", [])
                                 for c in content:
                                     if c.get("type") == "input_text" and c.get("text"):
                                         lead["transcript"].append(f"Caller: {c['text']}")
-                                        logger.info(f"Caller transcript captured: {c['text'][:80]}")
-                                    elif c.get("type") == "input_audio" and c.get("transcript"):
-                                        lead["transcript"].append(f"Caller: {c['transcript']}")
-                                        logger.info(f"Caller transcript captured: {c['transcript'][:80]}")
+                                        logger.info(f"Caller transcript captured (input_text): {c['text'][:80]}")
+                                    elif c.get("type") == "input_audio":
+                                        # Log full audio content item to see all available fields
+                                        logger.info(f"input_audio content keys: {list(c.keys())} transcript={c.get('transcript','NONE')[:80] if c.get('transcript') else 'NONE'}")
+                                        if c.get("transcript"):
+                                            lead["transcript"].append(f"Caller: {c['transcript']}")
+                                            logger.info(f"Caller transcript captured (input_audio): {c['transcript'][:80]}")
+                                    else:
+                                        logger.info(f"Unhandled user content type: {c.get('type')} keys={list(c.keys())}")
 
                         elif etype == "error":
                             logger.error(f"OpenAI error event: {msg.get('error')}")
