@@ -525,10 +525,9 @@ async def media_stream(websocket: WebSocket):
                                                 logger.info(f"Alex transcript (response.done fallback): {c['transcript'][:60]}")
 
                         # ── Transcript: Caller's words ───────────────────────
-                        elif etype == "conversation.item.created":
+                        elif etype == "conversation.item.added":
                             item = msg.get("item", {})
-                            # Log full item so we can see exact structure in Railway logs
-                            logger.info(f"conversation.item.created role={item.get('role')} content={str(item.get('content',''))[:300]}")
+                            logger.info(f"conversation.item.added role={item.get('role')} content={str(item.get('content',''))[:300]}")
                             if item.get("role") == "user":
                                 content = item.get("content", [])
                                 for c in content:
