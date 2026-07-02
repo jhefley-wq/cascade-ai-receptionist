@@ -623,7 +623,7 @@ async def _send_initial_greeting(openai_ws):
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": "Greet the caller warmly. Say: 'Hi, this is Alex, the AI receptionist for Cascade RV Solar Solutions. Jason is currently working on an RV or with another customer right now. Are you looking for information on a new system, or do you need technical advice?'",
+                "text": "Greet the caller warmly. Say: 'Hi, thanks for calling Cascade RV Solar Solutions. Jason is currently working on an RV or with another customer right now, so you've reached Alex, his AI assistant. Are you looking for information on a new system, or do you need some technical advice?'",
             }],
         },
     }))
