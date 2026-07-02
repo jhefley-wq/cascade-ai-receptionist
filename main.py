@@ -154,7 +154,8 @@ At the end of every appropriate conversation, ask whether they would like to sch
 a consultation or installation with Cascade RV Solar Solutions.
 
 IMPORTANT RULES:
-- Never make up prices or technical specs you are unsure of
+- NEVER QUOTE A PRICE OR A PRICE RANGE. If asked about cost, explain that pricing depends entirely on the specific RV and requirements, and that Jason will discuss pricing during his callback.
+- Never make up technical specs you are unsure of
 - If asked something you don't know, say Jason will be happy to discuss it in a consultation
 - Never pressure a customer into purchasing anything
 - Focus on helping them make informed decisions
@@ -197,7 +198,7 @@ def _gpt4o_extract(transcript_lines: list, caller_number: str) -> dict:
     transcript_text = "\n".join(transcript_lines)
     prompt = f"""Analyze this phone call transcript between an AI receptionist (Alex) and a caller.
 Extract the following fields. Return ONLY a JSON object with these exact keys (use null if not mentioned):
-- name: Caller's full name
+- name: Caller's first and last name (look closely at the greeting or when they are asked for contact info)
 - phone: Phone number the caller explicitly stated (not the caller ID)
 - email: Email address
 - rv_details: RV type, year, make, and model
@@ -524,24 +525,17 @@ async def media_stream(websocket: WebSocket):
                                                 logger.info(f"Alex transcript (response.done fallback): {c['transcript'][:60]}")
 
                         # ── Transcript: Caller's words ───────────────────────
-                        # OpenAI sends this when Whisper finishes transcribing the caller's speech
-                        elif etype == "conversation.item.input_audio_transcription.completed":
-                            t = msg.get("transcript", "").strip()
-                            if t:
-                                lead["transcript"].append(f"Caller: {t}")
-                                logger.info(f"Caller transcript captured: {t[:80]}")
-
-                        # Alternate event name used in some API versions
-                        elif etype == "input_audio_transcription.completed":
-                            t = msg.get("transcript", "").strip()
-                            if t:
-                                lead["transcript"].append(f"Caller: {t}")
-                                logger.info(f"Caller transcript (alt event) captured: {t[:80]}")
-
-                        # Catch-all: log any unhandled transcript-related events so we can
-                        # identify the correct event name from Railway logs if needed
-                        elif "transcript" in etype.lower() or "transcription" in etype.lower():
-                            logger.info(f"UNHANDLED transcript event [{etype}]: {str(msg)[:200]}") 
+                        elif etype == "conversation.item.created":
+                            item = msg.get("item", {})
+                            if item.get("role") == "user":
+                                content = item.get("content", [])
+                                for c in content:
+                                    if c.get("type") == "input_text" and c.get("text"):
+                                        lead["transcript"].append(f"Caller: {c['text']}")
+                                        logger.info(f"Caller transcript captured: {c['text'][:80]}")
+                                    elif c.get("type") == "input_audio" and c.get("transcript"):
+                                        lead["transcript"].append(f"Caller: {c['transcript']}")
+                                        logger.info(f"Caller transcript captured: {c['transcript'][:80]}")
 
                         elif etype == "error":
                             logger.error(f"OpenAI error event: {msg.get('error')}")
@@ -601,9 +595,9 @@ async def _send_session_update(openai_ws):
                     "format": {"type": "audio/pcm", "rate": 24000},
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
+                        "threshold": 0.8,  # Raised from 0.5 to reduce sensitivity to background noise
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 600,
+                        "silence_duration_ms": 1200,  # Raised from 600 to prevent cutting off callers who pause
                         "create_response": True,
                         "interrupt_response": True,
                     },
@@ -614,10 +608,7 @@ async def _send_session_update(openai_ws):
                     "speed": 1.0,
                 },
             },
-            "input_audio_transcription": {
-                "model": "whisper-1",
-                "language": "en",
-            },
+            # input_audio_transcription is removed because it causes invalid_request_error on this model version
         },
     }
     await openai_ws.send(json.dumps(session_update))
@@ -632,7 +623,7 @@ async def _send_initial_greeting(openai_ws):
             "role": "user",
             "content": [{
                 "type": "input_text",
-                "text": "Greet the caller warmly and professionally. Introduce yourself as Alex from Cascade RV Solar Solutions and ask how you can help them today. Keep it to one or two sentences.",
+                "text": "Greet the caller warmly. Say: 'Hi, this is Alex, the AI receptionist for Cascade RV Solar Solutions. Jason is currently working on an RV or with another customer right now. Are you looking for information on a new system, or do you need technical advice?'",
             }],
         },
     }))
