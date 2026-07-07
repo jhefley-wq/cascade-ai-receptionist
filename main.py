@@ -599,11 +599,15 @@ async def _send_session_update(openai_ws):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
+                    "transcription": {
+                        "model": "whisper-1",
+                        "language": "en",
+                    },
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.8,  # Raised from 0.5 to reduce sensitivity to background noise
+                        "threshold": 0.8,
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 1200,  # Raised from 600 to prevent cutting off callers who pause
+                        "silence_duration_ms": 1200,
                         "create_response": True,
                         "interrupt_response": True,
                     },
@@ -614,7 +618,7 @@ async def _send_session_update(openai_ws):
                     "speed": 1.0,
                 },
             },
-            # input_audio_transcription is removed because it causes invalid_request_error on this model version
+            # input_audio_transcription is now correctly nested at audio.input.transcription (GA format)
         },
     }
     await openai_ws.send(json.dumps(session_update))
