@@ -524,24 +524,29 @@ async def media_stream(websocket: WebSocket):
                                                 lead["transcript"].append(entry)
                                                 logger.info(f"Alex transcript (response.done fallback): {c['transcript'][:60]}")
 
-                        # ── Transcript: Caller's words ───────────────────────
+                        # ── Transcript: Caller's words via Whisper transcription ──────
+                        # This event fires after Whisper completes transcription of caller audio
+                        elif etype == "conversation.item.input_audio_transcription.completed":
+                            t = (msg.get("transcript") or "").strip()
+                            logger.info(f"Whisper transcription.completed full msg: {str(msg)[:400]}")
+                            if t:
+                                lead["transcript"].append(f"Caller: {t}")
+                                logger.info(f"Caller transcript captured (Whisper): {t[:80]}")
+
+                        # conversation.item.added fires immediately when item is created;
+                        # transcript is always None here for audio items, so we only use
+                        # it to capture injected text items (but filter out our own greeting prompt)
                         elif etype == "conversation.item.added":
                             item = msg.get("item", {})
-                            logger.info(f"conversation.item.added role={item.get('role')} content={str(item.get('content',''))[:300]}")
                             if item.get("role") == "user":
                                 content = item.get("content", [])
                                 for c in content:
                                     if c.get("type") == "input_text" and c.get("text"):
-                                        lead["transcript"].append(f"Caller: {c['text']}")
-                                        logger.info(f"Caller transcript captured (input_text): {c['text'][:80]}")
-                                    elif c.get("type") == "input_audio":
-                                        # Log full audio content item to see all available fields
-                                        logger.info(f"input_audio content keys: {list(c.keys())} transcript={c.get('transcript','NONE')[:80] if c.get('transcript') else 'NONE'}")
-                                        if c.get("transcript"):
-                                            lead["transcript"].append(f"Caller: {c['transcript']}")
-                                            logger.info(f"Caller transcript captured (input_audio): {c['transcript'][:80]}")
-                                    else:
-                                        logger.info(f"Unhandled user content type: {c.get('type')} keys={list(c.keys())}")
+                                        text = c["text"].strip()
+                                        # Filter out the injected greeting instruction
+                                        if not text.startswith("Greet the caller warmly"):
+                                            lead["transcript"].append(f"Caller: {text}")
+                                            logger.info(f"Caller transcript captured (input_text): {text[:80]}")
 
                         elif etype == "error":
                             logger.error(f"OpenAI error event: {msg.get('error')}")
