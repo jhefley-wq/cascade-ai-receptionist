@@ -23,7 +23,7 @@ When your phone is on **Do Not Disturb**, busy, or unanswered, calls will automa
 - Captures caller name, phone number, email, and inquiry details
 - Takes messages for Jason
 - Routes urgent calls by noting them for priority callback
-- Saves all leads to a file for manual CRM entry
+- Persists calls, status events, transcripts, and extracted lead fields in the configured database
 
 ---
 
@@ -182,6 +182,14 @@ Your receptionist comes with a web dashboard accessible at your server URL (e.g.
 ---
 
 ## Support
+
+## Recovery build: security, database, and staged cutover
+
+The recovery version uses SQLAlchemy with `DATABASE_URL` (Railway PostgreSQL-compatible) instead of an in-memory lead list. It requires `ADMIN_USERNAME` and `ADMIN_PASSWORD` before the dashboard, leads view, or receptionist toggle will expose data. It also supports `TWILIO_VALIDATE_SIGNATURES=true`, `TWILIO_WEBHOOK_BASE_URL`, `TWILIO_MEDIA_STREAM_URL`, and `OPENAI_REALTIME_MODEL` (default `gpt-realtime-2.1`).
+
+For a recovery or migration, follow **[RECOVERY_RUNBOOK.md](RECOVERY_RUNBOOK.md)**. It contains the required isolated staging validation, external-only JSON import procedure, and controlled cutover/rollback steps. Do not put snapshots, call data, or credentials in Git. This branch must be tested in a separate staging service before any operator changes a live Railway or Twilio configuration.
+
+---
 
 For questions about this AI receptionist setup, refer to:
 - [Twilio Documentation](https://www.twilio.com/docs)

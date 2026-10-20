@@ -4,3 +4,14 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Durable local development data and operator-provided recovery exports
+*.db
+*.sqlite
+*.sqlite3
+receptionist.db
+snapshots/
+backups/
+call-data/
+*.snapshot.json
+*.backup.json

@@ -15,8 +15,9 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-# Check for required packages
-python3 -c "import fastapi, uvicorn, twilio, openai" 2>/dev/null
+# Check for required packages, including durable SQLAlchemy storage and the
+# PostgreSQL driver used by Railway DATABASE_URL connections.
+python3 -c "import fastapi, uvicorn, twilio, openai, sqlalchemy, psycopg2" 2>/dev/null
 if [ $? -ne 0 ]; then
     echo "📦 Installing dependencies..."
     pip install -r requirements.txt
